@@ -1,0 +1,26 @@
+{
+  "category": "editors",
+  "dependencies": {
+    "just_game_engine_editor": "^0.1.0"
+  },
+  "editor": {
+    "editorOnlyLibraries": [
+      "*"
+    ],
+    "modules": [
+      {
+        "class": "SpriteStudioModule",
+        "library": "package:just_sprite_editor/editor.dart",
+        "order": 20
+      }
+    ]
+  },
+  "id": "just_sprite_editor",
+  "kind": "editor-extension",
+  "name": "Sprite Studio",
+  "requires": {
+    "just_game_engine": "^2.0.0"
+  },
+  "schema": 1,
+  "version": "0.1.0"
+}
