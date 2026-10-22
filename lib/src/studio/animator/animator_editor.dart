@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_game_engine/just_game_engine.dart';
 import 'package:just_editor_core/just_editor_core.dart'
-    show CommitTextField;
+    show CommitTextField, EditorKeys;
 import 'package:just_signals/just_signals.dart';
 
 import '../studio_panels.dart';
@@ -213,7 +213,7 @@ class AnimatorGraphEditorState extends State<AnimatorGraphEditor> {
       return KeyEventResult.ignored;
     }
     final keys = HardwareKeyboard.instance;
-    final ctrl = keys.isControlPressed || keys.isMetaPressed;
+    final ctrl = EditorKeys.primaryPressed;
     final key = event.logicalKey;
     if (ctrl && key == LogicalKeyboardKey.keyS) {
       save();

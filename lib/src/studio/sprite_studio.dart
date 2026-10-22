@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:just_editor_core/just_editor_core.dart' show EditorKeys;
 import 'package:just_signals/just_signals.dart';
 
 import '../document/io/sheet_export.dart';
@@ -362,7 +363,7 @@ class SpriteStudioState extends State<SpriteStudio> {
     }
     final key = event.logicalKey;
     final keys = HardwareKeyboard.instance;
-    final ctrl = keys.isControlPressed || keys.isMetaPressed;
+    final ctrl = EditorKeys.primaryPressed;
     final shift = keys.isShiftPressed;
 
     if (ctrl) {
@@ -388,6 +389,9 @@ class SpriteStudioState extends State<SpriteStudio> {
       }
       return KeyEventResult.handled;
     }
+    // The modifier no shortcut is made with (Ctrl on a Mac): a letter with
+    // it is not the bare letter's tool.
+    if (EditorKeys.otherPressed) return KeyEventResult.ignored;
 
     if (keys.isAltPressed && key == LogicalKeyboardKey.keyN) {
       s.addFrame();
@@ -564,7 +568,7 @@ class _TopBar extends StatelessWidget {
         tools: [
           StudioIconButton(
             icon: Icons.note_add_outlined,
-            tooltip: 'New sprite  (Ctrl+N)',
+            tooltip: 'New sprite  (${EditorKeys.withPrimary('N')})',
             onTap: state._newSprite,
           ),
           const SizedBox(width: 8),

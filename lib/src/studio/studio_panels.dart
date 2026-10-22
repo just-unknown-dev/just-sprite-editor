@@ -1,7 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:just_editor_core/just_editor_core.dart'
-    show CommitTextField;
+    show CommitTextField, EditorKeys;
 import 'package:just_signals/just_signals.dart';
 
 import '../document/palettes.dart';
@@ -190,22 +190,22 @@ class StudioHeader extends StatelessWidget {
               if (onSave != null)
                 StudioIconButton(
                   icon: Icons.save_outlined,
-                  tooltip: '$saveTooltip  (Ctrl+S)',
+                  tooltip: '$saveTooltip  (${EditorKeys.withPrimary('S')})',
                   active: dirty,
                   onTap: onSave,
                 ),
               StudioIconButton(
                 icon: Icons.undo,
                 tooltip: undoLabel == null
-                    ? 'Undo  (Ctrl+Z)'
-                    : 'Undo $undoLabel  (Ctrl+Z)',
+                    ? 'Undo  (${EditorKeys.withPrimary('Z')})'
+                    : 'Undo $undoLabel  (${EditorKeys.withPrimary('Z')})',
                 onTap: onUndo,
               ),
               StudioIconButton(
                 icon: Icons.redo,
                 tooltip: redoLabel == null
-                    ? 'Redo  (Ctrl+Y)'
-                    : 'Redo $redoLabel  (Ctrl+Y)',
+                    ? 'Redo  (${EditorKeys.withPrimary('Y')})'
+                    : 'Redo $redoLabel  (${EditorKeys.withPrimary('Y')})',
                 onTap: onRedo,
               ),
               if (tools.isNotEmpty) ...[
