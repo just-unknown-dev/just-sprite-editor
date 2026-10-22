@@ -1,10 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:just_game_engine/just_game_engine.dart';
-import 'package:just_game_engine_editor/just_game_engine_editor.dart'
+import 'package:just_editor_core/just_editor_core.dart'
     show PackageAssetPaths;
-import 'package:just_signals/just_signals.dart';
 
 /// What is selected in the graph: a state, a transition, or nothing.
 class GraphSelection {
@@ -309,6 +309,20 @@ class AnimatorGraphSession {
     apply(
       g.copyWith(
         parameters: [for (final p in g.parameters) p.name == name ? next : p],
+        // Blend trees follow the rename too.
+        states: !renamed
+            ? null
+            : [
+                for (final st in g.states)
+                  st.blend == null
+                      ? st
+                      : st.copyWith(
+                          blend: st.blend!.copyWith(
+                            parameter: st.blend!.parameter == name ? next.name : null,
+                            parameterY: st.blend!.parameterY == name ? next.name : null,
+                          ),
+                        ),
+              ],
         transitions: !renamed
             ? null
             : [
@@ -349,6 +363,26 @@ class AnimatorGraphSession {
     ),
   );
 
+  /// [state] blending by a number parameter: a 1-D tree with its current
+  /// clip as the one motion, to add to. Says so when there is no number
+  /// parameter to blend by.
+  void addBlendTree(AnimatorState state) {
+    final numbers = [
+      for (final p in g.parameters)
+        if (p.type == AnimatorParameterType.float || p.type == AnimatorParameterType.int) p.name,
+    ];
+    if (numbers.isEmpty) return say('Add a number parameter to blend by first.');
+    updateState(
+      state.name,
+      state.copyWith(
+        blend: AnimatorBlendTree(
+          parameter: numbers.first,
+          motions: [AnimatorBlendMotion(clip: state.clipName)],
+        ),
+      ),
+    );
+  }
+
   /// A condition that makes sense for [parameter]'s type, to start from.
   AnimatorCondition defaultConditionFor(AnimatorParameter parameter) =>
       switch (parameter.type) {
@@ -368,6 +402,17 @@ class AnimatorGraphSession {
   List<String> readClipNames() {
     final atlas = g.atlasPath.trim();
     if (atlas.isEmpty) return const [];
+    // A 3-D model's animations, for a graph that plays on its skeleton.
+    final lower = atlas.toLowerCase();
+    if (lower.endsWith('.glb') || lower.endsWith('.gltf')) {
+      try {
+        return modelClipNames(
+          PackageAssetPaths.of(root).file(atlas).readAsBytesSync(),
+        );
+      } catch (_) {
+        return const [];
+      }
+    }
     try {
       final json = jsonDecode(
         PackageAssetPaths.of(root).file(atlas).readAsStringSync(),
@@ -384,6 +429,34 @@ class AnimatorGraphSession {
     } catch (_) {
       return const [];
     }
+  }
+
+  /// The animation names of a glTF model, `.glb` or `.gltf` [bytes], as a
+  /// game names its clips: an unnamed one `animation <index>`.
+  static List<String> modelClipNames(Uint8List bytes) {
+    String text;
+    // A .glb: 'glTF', version, length, then the JSON chunk.
+    if (bytes.length >= 20 &&
+        bytes[0] == 0x67 &&
+        bytes[1] == 0x6C &&
+        bytes[2] == 0x54 &&
+        bytes[3] == 0x46) {
+      final view = ByteData.sublistView(bytes);
+      final length = view.getUint32(12, Endian.little);
+      text = utf8.decode(Uint8List.sublistView(bytes, 20, 20 + length));
+    } else {
+      text = utf8.decode(bytes);
+    }
+    final json = jsonDecode(text);
+    final animations = json is Map ? json['animations'] : null;
+    if (animations is! List) return const [];
+    return [
+      for (var i = 0; i < animations.length; i++)
+        switch (animations[i]) {
+          {'name': final String name} when name.isNotEmpty => name,
+          _ => 'animation $i',
+        },
+    ];
   }
 
   // ── Files ────────────────────────────────────────────────────────────────

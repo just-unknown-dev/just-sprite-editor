@@ -7,7 +7,7 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:just_game_engine/just_game_engine.dart' as jge;
-import 'package:just_game_engine_editor/just_game_engine_editor.dart';
+import 'package:just_editor_core/just_editor_core.dart';
 
 import 'just_sprite_editor.dart';
 import 'src/studio/studio_theme.dart';

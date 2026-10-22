@@ -1,6 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:just_game_engine_editor/just_game_engine_editor.dart'
+import 'package:just_editor_core/just_editor_core.dart'
     show CommitTextField;
 import 'package:just_signals/just_signals.dart';
 

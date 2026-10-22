@@ -3,12 +3,15 @@
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:just_game_engine/just_game_engine.dart';
 import 'package:just_sprite_editor/editor.dart';
 import 'package:just_sprite_editor/just_sprite_editor.dart';
+
+List<int> _u32(int v) => [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255];
 
 void main() {
   group('editing', () {
@@ -24,6 +27,28 @@ void main() {
       expect(s.g.stateNamed('idle2')!.clip, 'idle');
       expect(s.selection.value, const GraphSelection.state('idle2'));
       expect(s.isDirty, isTrue);
+    });
+
+    test('blend trees: added on a number parameter, following its rename', () {
+      s.addState(0, 0, clip: 'walk');
+      s.addBlendTree(s.g.stateNamed('walk')!);
+      expect(s.g.stateNamed('walk')!.blend, isNull);
+      expect(s.message.value, contains('number parameter'));
+      s.addParameter(name: 'speed', type: AnimatorParameterType.float);
+      s.addBlendTree(s.g.stateNamed('walk')!);
+      final tree = s.g.stateNamed('walk')!.blend!;
+      expect((tree.parameter, tree.motions.single.clip), ('speed', 'walk'));
+      s.updateParameter('speed', s.g.parameterNamed('speed')!.copyWith(name: 'pace'));
+      expect(s.g.stateNamed('walk')!.blend!.parameter, 'pace');
+      // A crossfade, and both read back from the saved file as version 2.
+      s
+        ..addState(0, 0, clip: 'idle')
+        ..addTransition('idle', 'walk');
+      s.updateTransition(0, s.g.transitions.first.copyWith(duration: 0.2));
+      final back = AnimatorGraph.parse(s.g.encode());
+      expect(jsonDecode(s.g.encode())['version'], 2);
+      expect(back.transitions.first.duration, 0.2);
+      expect(back.stateNamed('walk')!.blend!.parameter, 'pace');
     });
 
     test('renaming a state follows through transitions and the entry', () {
@@ -136,6 +161,38 @@ void main() {
         expect(reopened.g.toJson(), session.g.toJson());
       },
     );
+
+    test("a 3-D model's animations are its clips, in a .gltf or a .glb", () {
+      final dir = Directory.systemTemp.createTempSync('animator_model');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final root = dir.path.replaceAll('\\', '/');
+      final json = jsonEncode({
+        'asset': {'version': '2.0'},
+        'animations': [
+          {'name': 'walk', 'channels': [], 'samplers': []},
+          {'channels': [], 'samplers': []},
+        ],
+      });
+      File('$root/hero.gltf').writeAsStringSync(json);
+      // A .glb: header, then the JSON chunk padded to 4 bytes.
+      final text = utf8.encode(json.padRight((json.length + 3) & ~3));
+      final glb = BytesBuilder()
+        ..add(utf8.encode('glTF'))
+        ..add(_u32(2))
+        ..add(_u32(20 + text.length))
+        ..add(_u32(text.length))
+        ..add(utf8.encode('JSON'))
+        ..add(text);
+      File('$root/hero.glb').writeAsBytesSync(glb.toBytes());
+      for (final file in ['hero.gltf', 'hero.glb']) {
+        final session = AnimatorGraphSession(
+          AnimatorGraph(atlasPath: file),
+          root: root,
+        );
+        addTearDown(session.dispose);
+        expect(session.readClipNames(), ['walk', 'animation 1'], reason: file);
+      }
+    });
   });
 
   testWidgets('its header: full screen beside close, a dot while unsaved, '

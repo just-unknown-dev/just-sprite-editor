@@ -25,7 +25,8 @@ dependencies:
 
   # Design-time only. `lib/just_sprite_editor.dart` never imports it; only
   # `lib/editor.dart` does, and a game never imports that.
-  just_game_engine_editor: ^0.1.0
+  just_editor_core: ^0.1.0-dev.1
+  just_game_engine_formats: ^0.2.0
 
 dev_dependencies:
   flutter_test:

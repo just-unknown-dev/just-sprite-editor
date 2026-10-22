@@ -1,7 +1,7 @@
 {
   "category": "editors",
   "dependencies": {
-    "just_game_engine_editor": "^0.1.0"
+    "just_game_engine_editor": "^0.1.0-dev.1"
   },
   "editor": {
     "editorOnlyLibraries": [

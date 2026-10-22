@@ -7,7 +7,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:just_game_engine_editor/just_game_engine_editor.dart';
+import 'package:just_editor_core/just_editor_core.dart';
 import 'package:just_sprite_editor/editor.dart';
 import 'package:just_sprite_editor/just_sprite_editor.dart';
 import 'package:just_sprite_editor/src/studio/studio_canvas.dart';

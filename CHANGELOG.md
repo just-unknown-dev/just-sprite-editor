@@ -2,6 +2,11 @@
 
 ## 0.1.0 (unreleased)
 
+- **Builds on `just_editor_core`**, the editor's module contract, instead of depending on `just_game_engine_editor`: the module's code needs nothing else of the editor.
+
+- The animator graph editor edits animator graph format 2: a transition's **Blend (s)** (how long a 3-D model crossfades; a sprite always cuts), and a state's **blend tree**: one or two number parameters, and its motions (a clip each, at a threshold or a point). A sprite plays the heaviest motion. Renaming a parameter renames it in blend trees too.
+- The animator's clip source ("Clips from") can be a 3-D model (`.glb` or `.gltf`) as well as an atlas: its animations are the clips offered, named as the game names them.
+
 - **Typed values are kept when the field is left** — Enter, Tab, or a click anywhere else — in the frame duration, the hex colour and every animator field (parameters, conditions, the atlas path), as everywhere in the editor. They used to be kept on Enter alone, leaving a typed value on screen and the sprite as it was. Esc puts back what was there; a duration that is not a whole number above 0, or text that is not a colour, does too. They are `CommitTextField`s from the editor's kit.
 
 - Compression comes from `just_deflate` instead of `dart:io`, for .jsprite cels, PNG pixels and Aseprite cels. The document core (`package:just_sprite_editor/document.dart`) no longer imports `dart:io`, so it runs on the web too. `Crc32.of` is now `just_deflate`'s `crc32`. Saved files read as before. Saved again, their cels are the same pixels in slightly smaller bytes.

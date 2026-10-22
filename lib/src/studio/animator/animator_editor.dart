@@ -5,7 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_game_engine/just_game_engine.dart';
-import 'package:just_game_engine_editor/just_game_engine_editor.dart'
+import 'package:just_editor_core/just_editor_core.dart'
     show CommitTextField;
 import 'package:just_signals/just_signals.dart';
 
@@ -345,7 +345,7 @@ class AnimatorGraphEditorState extends State<AnimatorGraphEditor> {
       onToggleFullScreen: widget.onToggleFullScreen,
       onClose: widget.onClose == null ? null : close,
       tools: [
-        Text('Atlas', style: StudioTheme.label),
+        Text('Clips from', style: StudioTheme.label),
         const SizedBox(width: 6),
         SizedBox(
           width: 260,
@@ -353,13 +353,13 @@ class AnimatorGraphEditorState extends State<AnimatorGraphEditor> {
           child: _TextBox(
             key: ValueKey('atlas:${s.g.atlasPath}'),
             value: s.g.atlasPath,
-            hint: 'assets/sprites/hero.json — where the clips come from',
+            hint: 'an atlas (hero.json) or a 3D model (hero.glb)',
             onSubmitted: (v) => s.apply(s.g.copyWith(atlasPath: v.trim())),
           ),
         ),
         StudioIconButton(
           icon: Icons.auto_awesome_motion_outlined,
-          tooltip: 'Add a state for every clip in the atlas',
+          tooltip: 'Add a state for every clip in the atlas or model',
           onTap: () {
             final n = s.addStatesForClips(s.readClipNames());
             s.say(
@@ -1074,6 +1074,8 @@ class _Inspector extends StatelessWidget {
         ),
       ),
       const SizedBox(height: 8),
+      _blendTree(s, state),
+      const SizedBox(height: 8),
       // A Wrap, not a Row: with a large text scale the two do not fit side
       // by side, and wrapping is better than clipping.
       Wrap(
@@ -1095,6 +1097,149 @@ class _Inspector extends StatelessWidget {
       ),
     ],
   );
+
+  /// A state's blend tree: none (a button to add one), or its parameters
+  /// and motions.
+  Widget _blendTree(AnimatorGraphSession s, AnimatorState state) {
+    final tree = state.blend;
+    if (tree == null) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: Tooltip(
+          message:
+              'Play several clips weighted by a parameter: walk to run by '
+              'speed. A sprite plays the heaviest; a 3-D model blends them.',
+          waitDuration: const Duration(milliseconds: 600),
+          child: TextButton(onPressed: () => s.addBlendTree(state), child: const Text('Blend by a parameter')),
+        ),
+      );
+    }
+    final numbers = [
+      for (final p in s.g.parameters)
+        if (p.type == AnimatorParameterType.float || p.type == AnimatorParameterType.int) p.name,
+    ];
+    void update(AnimatorBlendTree next) => s.updateState(state.name, state.copyWith(blend: next));
+    Widget number(String value, void Function(double) onValue) => SizedBox(
+      height: 26,
+      width: 54,
+      child: _TextBox(
+        value: value,
+        onSubmitted: (v) {
+          final x = double.tryParse(v.trim());
+          if (x != null) onValue(x);
+        },
+      ),
+    );
+    final twoD = tree.type == AnimatorBlendType.twoD;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text('BLEND TREE', style: StudioTheme.heading),
+        _labelled(
+          'Axes',
+          _Choice<AnimatorBlendType>(
+            value: tree.type,
+            options: AnimatorBlendType.values,
+            label: (t) => t == AnimatorBlendType.oneD ? 'one parameter' : 'two parameters',
+            onChanged: (t) => update(tree.copyWith(type: t, parameterY: tree.parameterY.isEmpty ? tree.parameter : null)),
+          ),
+        ),
+        _labelled(
+          twoD ? 'Across' : 'By',
+          _Choice<String>(
+            value: tree.parameter,
+            options: {...numbers, tree.parameter}.toList(),
+            label: (p) => p,
+            onChanged: (p) => update(tree.copyWith(parameter: p)),
+          ),
+        ),
+        if (twoD)
+          _labelled(
+            'Up',
+            _Choice<String>(
+              value: tree.parameterY,
+              options: {...numbers, tree.parameterY}.toList(),
+              label: (p) => p,
+              onChanged: (p) => update(tree.copyWith(parameterY: p)),
+            ),
+          ),
+        for (var i = 0; i < tree.motions.length; i++)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: _Choice<String>(
+                    value: tree.motions[i].clip,
+                    options: {...clips, tree.motions[i].clip}.toList(),
+                    label: (c) => c.isEmpty ? '(no clip)' : c,
+                    onChanged: (c) => update(
+                      tree.copyWith(
+                        motions: [
+                          for (var k = 0; k < tree.motions.length; k++)
+                            k == i ? _motion(tree.motions[k], clip: c) : tree.motions[k],
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                if (!twoD)
+                  number('${tree.motions[i].threshold}', (x) => update(_withMotion(tree, i, threshold: x)))
+                else ...[
+                  number('${tree.motions[i].x}', (x) => update(_withMotion(tree, i, x: x))),
+                  const SizedBox(width: 2),
+                  number('${tree.motions[i].y}', (y) => update(_withMotion(tree, i, y: y))),
+                ],
+                StudioIconButton(
+                  icon: Icons.close,
+                  tooltip: 'Remove this motion',
+                  size: 22,
+                  onTap: () => update(
+                    tree.copyWith(motions: [
+                      for (var k = 0; k < tree.motions.length; k++)
+                        if (k != i) tree.motions[k],
+                    ]),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        Wrap(
+          alignment: WrapAlignment.spaceBetween,
+          children: [
+            TextButton(
+              onPressed: () => update(
+                tree.copyWith(motions: [...tree.motions, AnimatorBlendMotion(clip: state.clipName)]),
+              ),
+              child: const Text('Add motion'),
+            ),
+            TextButton(
+              onPressed: () => s.updateState(state.name, state.copyWith(clearBlend: true)),
+              child: Text('Remove blend', style: TextStyle(color: StudioTheme.danger)),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  static AnimatorBlendMotion _motion(AnimatorBlendMotion m, {String? clip, double? threshold, double? x, double? y}) =>
+      AnimatorBlendMotion(
+        clip: clip ?? m.clip,
+        threshold: threshold ?? m.threshold,
+        x: x ?? m.x,
+        y: y ?? m.y,
+        speed: m.speed,
+      );
+
+  static AnimatorBlendTree _withMotion(AnimatorBlendTree tree, int i, {double? threshold, double? x, double? y}) =>
+      tree.copyWith(
+        motions: [
+          for (var k = 0; k < tree.motions.length; k++)
+            k == i ? _motion(tree.motions[k], threshold: threshold, x: x, y: y) : tree.motions[k],
+        ],
+      );
 
   Widget _transition(AnimatorGraphSession s, int index, AnimatorTransition t) {
     final params = s.g.parameters;
@@ -1189,6 +1334,27 @@ class _Inspector extends StatelessWidget {
             ),
           ),
         const SizedBox(height: 6),
+        _labelled(
+          'Blend (s)',
+          SizedBox(
+            height: 26,
+            child: Tooltip(
+              message:
+                  'Seconds the old state fades into the new one. A 3-D model '
+                  'crossfades; a sprite always cuts.',
+              waitDuration: const Duration(milliseconds: 600),
+              child: _TextBox(
+                value: '${t.duration}',
+                onSubmitted: (v) {
+                  final d = double.tryParse(v.trim());
+                  if (d != null && d >= 0) {
+                    s.updateTransition(index, t.copyWith(duration: d));
+                  }
+                },
+              ),
+            ),
+          ),
+        ),
         _labelled(
           'Priority',
           SizedBox(
