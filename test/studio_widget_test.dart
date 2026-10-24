@@ -41,6 +41,18 @@ Future<SpriteStudioSession> _pump(
   return key.currentState!.session!;
 }
 
+/// Lets work done off the test's clock — files, the sprite list's scan in
+/// another isolate — finish, then the frames it asked for, until [until]
+/// holds (or a while has passed).
+Future<void> _settleIO(WidgetTester tester, {bool Function()? until}) async {
+  for (var i = 0; i < 100 && !(until?.call() ?? false); i++) {
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 20)),
+    );
+    await tester.pump();
+  }
+}
+
 /// The screen position of the middle of sprite pixel ([x], [y]).
 Offset _pixel(WidgetTester tester, SpriteStudioSession s, int x, int y) {
   final box = tester.getRect(find.byType(StudioCanvas));
@@ -279,6 +291,11 @@ void main() {
       ..writeAsStringSync('{}');
 
     await _pump(tester, root: project.path);
+    // The list is found in the background.
+    await _settleIO(
+      tester,
+      until: () => find.text('hero.jsprite').evaluate().isNotEmpty,
+    );
 
     // The panel is there from the start: opening another sprite in the
     // same project should not mean going back to the Assets dock.
@@ -299,6 +316,10 @@ void main() {
       ..writeAsStringSync('{}');
 
     await _pump(tester, root: project.path);
+    await _settleIO(
+      tester,
+      until: () => find.text('hero.jsprite').evaluate().isNotEmpty,
+    );
 
     Finder handle() => find.byWidgetPredicate(
       (w) => w is MouseRegion && w.cursor == SystemMouseCursors.resizeRow,

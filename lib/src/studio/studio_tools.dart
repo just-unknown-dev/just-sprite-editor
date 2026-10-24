@@ -43,7 +43,10 @@ int _colorFor(SpriteStudioSession s, ToolButton button, {bool erase = false}) {
   return button == ToolButton.primary ? s.primary.value : s.secondary.value;
 }
 
-void _paint(
+/// Stamps [points] with the session's brush, mirrored as it is set, into
+/// [target] (inside the selection, if there is one). Returns the
+/// rectangle that may have changed, for the next [CelStroke.reset].
+IntRect _paint(
   SpriteStudioSession s,
   PixelBuffer target,
   List<Pixel> points,
@@ -60,54 +63,117 @@ void _paint(
           for (final p in points)
             for (final b in brush) (x: p.x + b.x, y: p.y + b.y),
         ];
+  final all = Raster.mirrored(covered, s.symmetry.value, doc.width, doc.height);
   Raster.stamp(
     target,
-    Raster.mirrored(covered, s.symmetry.value, doc.width, doc.height),
+    all,
     const [(x: 0, y: 0)],
     color,
     mask: s.selection.value,
   );
+  return _boundsOf(all);
+}
+
+IntRect _boundsOf(List<Pixel> points) {
+  if (points.isEmpty) return IntRect.empty;
+  var minX = points.first.x, maxX = minX;
+  var minY = points.first.y, maxY = minY;
+  for (final p in points) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  return IntRect(minX, minY, maxX + 1, maxY + 1);
 }
 
 /// Pencil and eraser: a path of pixels, stamped with the brush.
+///
+/// Each move stamps only the pixels it adds. Pixel-perfect cleaning (a
+/// one-pixel brush) can take back a point already laid down — the corner
+/// of an L the new point makes — so every canvas pixel the stroke covers
+/// counts the stamps on it, and goes back to what it was only when the
+/// last of them is gone. The result is the same as stamping the whole
+/// cleaned path at once.
 class FreehandTool extends PixelTool {
   FreehandTool({required this.erase});
 
   final bool erase;
   CelStroke? _stroke;
-  final List<Pixel> _path = [];
+  Pixel _last = (x: 0, y: 0);
   int _color = 0;
+
+  // Fixed for the stroke when it begins.
+  List<Pixel> _brush = const [(x: 0, y: 0)];
+  Symmetry _symmetry = Symmetry.none;
+  SelectionMask? _mask;
+  PixelPerfectPath? _clean;
+
+  /// Stamps on each covered pixel, by its index in the cel.
+  final Map<int, int> _stamps = {};
 
   @override
   void down(SpriteStudioSession s, int x, int y, ToolButton button) {
     _stroke = s.beginStroke(erase ? 'Eraser' : 'Pencil');
     if (_stroke == null) return;
     _color = _colorFor(s, button, erase: erase);
-    _path
-      ..clear()
-      ..add((x: x, y: y));
-    _redraw(s);
+    _brush = Raster.brush(s.brushSize.value);
+    _symmetry = s.symmetry.value;
+    _mask = s.selection.value;
+    _clean = s.pixelPerfect.value && s.brushSize.value == 1
+        ? PixelPerfectPath()
+        : null;
+    _stamps.clear();
+    _last = (x: x, y: y);
+    _add(_last);
+    _changed(s);
   }
 
   @override
   void drag(SpriteStudioSession s, int x, int y) {
-    if (_stroke == null) return;
-    final last = _path.last;
-    if (last.x == x && last.y == y) return;
+    final stroke = _stroke;
+    if (stroke == null || stroke.isDone) return;
+    if (_last.x == x && _last.y == y) return;
     // A fast pointer skips pixels; join the dots.
-    _path.addAll(Raster.line(last.x, last.y, x, y).skip(1));
-    _redraw(s);
+    for (final p in Raster.line(_last.x, _last.y, x, y).skip(1)) {
+      _add(p);
+    }
+    _last = (x: x, y: y);
+    _changed(s);
   }
 
-  /// The whole stroke is redrawn from the cel as it was: pixel-perfect
-  /// cleaning changes pixels already laid down, which an incremental stamp
-  /// could not take back.
-  void _redraw(SpriteStudioSession s) {
-    final stroke = _stroke!..reset();
-    final clean = s.pixelPerfect.value && s.brushSize.value == 1
-        ? Raster.pixelPerfect(_path)
-        : _path;
-    _paint(s, stroke.buffer, clean, _color);
+  void _add(Pixel p) {
+    final corner = _clean?.add(p);
+    if (corner != null) _stamp(corner, -1);
+    _stamp(p, 1);
+  }
+
+  /// Lays the brush down at [p] ([delta] 1), or takes one such stamp back
+  /// ([delta] -1).
+  void _stamp(Pixel p, int delta) {
+    final stroke = _stroke!;
+    final target = stroke.buffer, before = stroke.original;
+    final w = target.width, h = target.height;
+    final mask = _mask;
+    final covered = _brush.length == 1
+        ? [p]
+        : [for (final b in _brush) (x: p.x + b.x, y: p.y + b.y)];
+    for (final t in Raster.mirrored(covered, _symmetry, w, h)) {
+      if (t.x < 0 || t.y < 0 || t.x >= w || t.y >= h) continue;
+      if (mask != null && !mask.contains(t.x, t.y)) continue;
+      final i = t.y * w + t.x;
+      final n = (_stamps[i] ?? 0) + delta;
+      if (n > 0) {
+        _stamps[i] = n;
+        target.pixels[i] = _color;
+      } else {
+        _stamps.remove(i);
+        target.pixels[i] = before.pixels[i];
+      }
+    }
+  }
+
+  void _changed(SpriteStudioSession s) {
     s.document.touch();
     s.changed();
   }
@@ -158,7 +224,9 @@ class PickerTool extends PixelTool {
 
   @override
   void drag(SpriteStudioSession s, int x, int y) {
-    final color = s.document.flatten(s.frameIndex.value).get(x, y);
+    // The one pixel through every visible layer, rather than the whole
+    // frame drawn on every move to read it.
+    final color = s.document.pixelAt(s.frameIndex.value, x, y);
     if (Argb.alpha(color) == 0) return;
     (_button == ToolButton.primary ? s.primary : s.secondary).value = color;
   }
@@ -175,6 +243,9 @@ class ShapeTool extends PixelTool {
   CelStroke? _stroke;
   int _x0 = 0, _y0 = 0, _color = 0;
 
+  /// Where the shape was last drawn: all a redraw has to put back.
+  IntRect _drawn = IntRect.empty;
+
   @override
   void down(SpriteStudioSession s, int x, int y, ToolButton button) {
     _stroke = s.beginStroke(switch (kind) {
@@ -186,21 +257,22 @@ class ShapeTool extends PixelTool {
     _x0 = x;
     _y0 = y;
     _color = _colorFor(s, button);
+    _drawn = IntRect.empty;
     drag(s, x, y);
   }
 
   @override
   void drag(SpriteStudioSession s, int x, int y) {
     final stroke = _stroke;
-    if (stroke == null) return;
-    stroke.reset();
+    if (stroke == null || stroke.isDone) return;
+    if (!_drawn.isEmpty) stroke.reset(_drawn);
     final filled = s.filledShapes.value;
     final points = switch (kind) {
       ShapeKind.line => Raster.line(_x0, _y0, x, y),
       ShapeKind.rectangle => Raster.rectangle(_x0, _y0, x, y, filled: filled),
       ShapeKind.ellipse => Raster.ellipse(_x0, _y0, x, y, filled: filled),
     };
-    _paint(s, stroke.buffer, points, _color);
+    _drawn = _paint(s, stroke.buffer, points, _color);
     s.document.touch();
     s.changed();
   }
@@ -258,6 +330,9 @@ class MoveTool extends PixelTool {
   IntRect _from = IntRect.empty;
   int _x0 = 0, _y0 = 0;
 
+  /// Where the lifted pixels were last put down.
+  IntRect _placed = IntRect.empty;
+
   @override
   void down(SpriteStudioSession s, int x, int y, ToolButton button) {
     _stroke = s.beginStroke('Move');
@@ -268,6 +343,7 @@ class MoveTool extends PixelTool {
         s.selection.value ??
         SelectionMask.rect(doc.width, doc.height, doc.bounds);
     _from = _mask!.bounds;
+    _placed = _from;
     _lifted = _mask!.lift(stroke.original);
     _x0 = x;
     _y0 = y;
@@ -276,11 +352,14 @@ class MoveTool extends PixelTool {
   @override
   void drag(SpriteStudioSession s, int x, int y) {
     final stroke = _stroke;
-    if (stroke == null) return;
+    if (stroke == null || stroke.isDone) return;
     final dx = x - _x0, dy = y - _y0;
-    stroke.reset();
+    // Only what the last move touched goes back: where the pixels came
+    // from, and where they were put down.
+    stroke.reset(_from.union(_placed));
     _mask!.clearIn(stroke.buffer);
-    stroke.buffer.composite(_lifted!, _from.left + dx, _from.top + dy);
+    _placed = _from.translate(dx, dy);
+    stroke.buffer.composite(_lifted!, _placed.left, _placed.top);
     if (s.selection.value != null) {
       s.selection.value = _mask!.translated(dx, dy);
     }
@@ -304,7 +383,7 @@ class MoveTool extends PixelTool {
   }
 }
 
-/// Edits that are not gestures: the Edit menu.
+// Edits that are not gestures: the Edit menu.
 abstract final class StudioActions {
   /// Clears the selection's pixels (or the whole cel) on the active layer.
   static void deletePixels(SpriteStudioSession s) {

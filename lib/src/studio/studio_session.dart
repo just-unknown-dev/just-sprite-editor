@@ -1,5 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:just_editor_core/just_editor_core.dart'
@@ -14,6 +17,7 @@ import '../document/io/sheet_export.dart';
 import '../document/pixel_buffer.dart';
 import '../document/raster.dart';
 import '../document/sprite_document.dart';
+import 'studio_files.dart';
 
 /// The tools the studio has, in palette order.
 enum StudioTool {
@@ -52,11 +56,31 @@ class OnionSkin {
 
 /// What saving wrote.
 class SavedSprite {
-  const SavedSprite(this.projectPath, this.sheetPath, this.atlasPath);
+  const SavedSprite(
+    this.projectPath,
+    this.sheetPath,
+    this.atlasPath, {
+    this.sheetProblem,
+  });
 
   final String projectPath;
   final String sheetPath;
   final String atlasPath;
+
+  /// Why the sheet and atlas were not written, when they could not be — a
+  /// sheet too big for a game to load; null when they were. The project
+  /// is saved either way.
+  final String? sheetProblem;
+}
+
+/// What a save writes, made off the UI thread.
+class _Encoded {
+  const _Encoded(this.project, this.png, this.atlas, this.sheetProblem);
+
+  final String project;
+  final Uint8List? png;
+  final String? atlas;
+  final String? sheetProblem;
 }
 
 /// One open sprite: the document, how it is being looked at, and what the
@@ -81,8 +105,18 @@ class SpriteStudioSession {
 
   SpriteDocument get document => editor.document;
 
-  /// Bumped whenever the document changes — pixels or structure.
+  /// Bumped whenever the document changes — pixels or structure. Every
+  /// move of a stroke bumps it: only the canvas should watch it.
   final Signal<int> revision = Signal(0, debugLabel: 'spriteRevision');
+
+  /// Bumped when the document's shape or its history changes — a step
+  /// recorded, undone or redone, a save — but not by the pixels of a
+  /// stroke still being drawn. What the panels and the header watch.
+  final Signal<int> structureRevision = Signal(
+    0,
+    debugLabel: 'spriteStructure',
+  );
+  int _seenVersion = 0;
 
   final Signal<int> layerIndex = Signal(0, debugLabel: 'spriteLayer');
   final Signal<int> frameIndex = Signal(0, debugLabel: 'spriteFrame');
@@ -160,8 +194,10 @@ class SpriteStudioSession {
   /// [fileName], with a dot while there is work not saved.
   String get title => isDirty ? '$fileName •' : fileName;
 
-  /// Call after anything changed the document.
-  void changed() {
+  /// Call after anything changed the document. [structure] says the change
+  /// is one the panels show although no step was recorded — a slider
+  /// being dragged.
+  void changed({bool structure = false}) {
     // Frames or layers may have gone from under the cursor.
     final l = layerIndex.value.clamp(0, document.layers.length - 1);
     final f = frameIndex.value.clamp(0, document.frames.length - 1);
@@ -172,8 +208,27 @@ class SpriteStudioSession {
         (s.width != document.width || s.height != document.height)) {
       selection.value = null;
     }
+    if (structure || editor.version != _seenVersion) {
+      _seenVersion = editor.version;
+      structureRevision.value++;
+    }
     revision.value = document.revision;
   }
+
+  /// Whether [layerId] has anything drawn in [frameId]: a timeline dot.
+  /// Worked out once per [structureRevision], not on every rebuild.
+  bool celHasArt(int layerId, int frameId) {
+    if (_artAt != structureRevision.value) {
+      _art.clear();
+      _artAt = structureRevision.value;
+    }
+    final cel = document.cel(layerId, frameId);
+    if (cel == null) return false;
+    return _art[cel] ??= !cel.isBlank;
+  }
+
+  final Map<PixelBuffer, bool> _art = Map.identity();
+  int _artAt = -1;
 
   void say(String text) => message.forceSet(text);
 
@@ -276,6 +331,25 @@ class SpriteStudioSession {
     );
   }
 
+  /// Cuts the current frame's picture — every visible layer — into frames
+  /// of [frameWidth] × [frameHeight], reading the rows left to right and
+  /// leaving out empty cells: for a sheet that was opened as one image.
+  /// The sprite becomes those frames, on one layer, as one step that undo
+  /// takes back. Returns how many frames it made.
+  int sliceIntoFrames(int frameWidth, int frameHeight) {
+    final sliced = SheetImporter.fromSheet(
+      document.flatten(frameIndex.value),
+      frameWidth: frameWidth,
+      frameHeight: frameHeight,
+      durationMs: frame.durationMs,
+    )..palette.addAll(document.palette);
+    stop();
+    structural('Slice into frames', (d) => d.replaceWith(sliced));
+    layerIndex.value = 0;
+    frameIndex.value = 0;
+    return document.frames.length;
+  }
+
   // ── Frames and playback ──────────────────────────────────────────────────
 
   void goToFrame(int index) =>
@@ -376,38 +450,109 @@ class SpriteStudioSession {
   /// Saves the project to [to] (or where it already lives) and re-exports
   /// the sheet and atlas JSON beside it, so the game is never a step behind
   /// the drawing.
+  ///
+  /// The first save keeps what was there before any project was — an
+  /// imported image, an atlas some other tool wrote — as
+  /// `name.original.png` and `name.original.json`. Each file is written
+  /// whole or not at all, the project last. Throws [StateError] for a
+  /// sprite too big to save ([SpriteDocument.fitsForSaving]); a sheet too
+  /// big for a game to load is left unwritten, and
+  /// [SavedSprite.sheetProblem] says why.
   Future<SavedSprite> save({String? to, SheetExportOptions? options}) async {
     final target = to ?? path;
     if (target == null) {
       throw StateError('A new sprite needs a path to save to.');
     }
+    if (!document.fitsForSaving) throw StateError(tooBigToSaveMessage);
     final base = _withoutExtension(target);
     final project = '$base.${JspriteCodec.extension}';
     final name = base.split('/').last;
-    final export = SheetExporter.export(
+    // What is saved is the document as it is now; anything drawn while the
+    // files are written belongs to the next save.
+    final version = editor.version;
+    final encoded = await _encode(
       document,
-      name: name,
-      imageFile: '$name.png',
-      options: options ?? document.exportOptions,
+      name,
+      options ?? document.exportOptions,
     );
     await _file(project).parent.create(recursive: true);
-    // A sheet that was here before any project was is somebody's original
-    // art, imported: keep it, once, rather than write the export over it.
-    final sheet = _file('$base.png');
-    final keep = _file('$base.original.png');
-    if (!await _file(project).exists() &&
-        await sheet.exists() &&
-        !await keep.exists()) {
-      await sheet.copy(keep.path);
+    // What was here before any project was is somebody's original work,
+    // imported: keep it, once, rather than write the export over it.
+    if (!await _file(project).exists()) {
+      for (final ext in const ['png', 'json']) {
+        final was = _file('$base.$ext');
+        final keep = _file('$base.original.$ext');
+        if (await was.exists() && !await keep.exists()) {
+          await was.copy(keep.path);
+        }
+      }
     }
-    await _file(project).writeAsString(JspriteCodec.encode(document));
-    await _file('$base.png').writeAsBytes(export.pngBytes);
-    await _file('$base.json').writeAsString(export.jsonText);
+    if (encoded.png != null) {
+      await writeAtomically(_file('$base.png'), encoded.png!);
+      await writeAtomically(_file('$base.json'), utf8.encode(encoded.atlas!));
+    }
+    await writeAtomically(_file(project), utf8.encode(encoded.project));
     path = project;
-    editor.markSaved();
+    if (editor.version == version) editor.markSaved();
     changed();
-    say('Saved $name');
-    return SavedSprite(project, '$base.png', '$base.json');
+    say(
+      encoded.sheetProblem == null
+          ? 'Saved $name'
+          : 'Saved $name, but not its sheet: ${encoded.sheetProblem}',
+    );
+    return SavedSprite(
+      project,
+      '$base.png',
+      '$base.json',
+      sheetProblem: encoded.sheetProblem,
+    );
+  }
+
+  /// Why this sprite cannot be saved as it is: bigger than
+  /// [SpriteDocument.maxSize].
+  String get tooBigToSaveMessage =>
+      'This picture is ${document.width} × ${document.height}; a sprite can '
+      'be at most ${SpriteDocument.maxSize} × ${SpriteDocument.maxSize}. '
+      'Slice it into frames, crop it or make the canvas smaller, then save.';
+
+  // Static, so that the closure sent to the other isolate holds only what
+  // it is given — never the session, its signals and its timers.
+  static Future<_Encoded> _encode(
+    SpriteDocument doc,
+    String name,
+    SheetExportOptions options,
+  ) => Isolate.run(() {
+    final project = JspriteCodec.encode(doc);
+    try {
+      final export = SheetExporter.export(
+        doc,
+        name: name,
+        imageFile: '$name.png',
+        options: options,
+      );
+      return _Encoded(project, export.pngBytes, export.jsonText, null);
+    } on ArgumentError catch (e) {
+      return _Encoded(project, null, null, '${e.message}');
+    }
+  });
+
+  /// The project files saving to [target] would write over that this
+  /// sprite did not write itself — for a host to ask about first. Empty
+  /// when [target] is where this sprite already lives.
+  ///
+  /// A new sprite (or one saved somewhere new) is in the way of anything
+  /// there: another sprite's project, a sheet, an atlas. A sprite opened
+  /// from an image, saved beside it for the first time, is only in the way
+  /// of an atlas: the image is what it was opened from.
+  Future<List<String>> filesInTheWay(String target) async {
+    final base = _withoutExtension(target);
+    final project = '$base.${JspriteCodec.extension}';
+    final own = path != null && _withoutExtension(path!) == base;
+    if (own && await _file(project).exists()) return const [];
+    return [
+      for (final p in [project, '$base.png', '$base.json'])
+        if ((!own || p.endsWith('.json')) && await _file(p).exists()) p,
+    ];
   }
 
   /// Writes the animation — the tag being played, or every frame — as a GIF
@@ -423,14 +568,21 @@ class SpriteStudioSession {
         ? document.width
         : document.height;
     final scale = (192 / longest).floor().clamp(1, 8);
-    final suffix = tag == null ? '' : '_${tag.name}';
+    // A tag's name is the artist's: made safe before it is a file's.
+    final suffix = tag == null ? '' : '_${safeFileName(tag.name)}';
     final out = '${_withoutExtension(target)}$suffix.gif';
-    await _file(
-      out,
-    ).writeAsBytes(GifEncoder.encodeDocument(document, tag: tag, scale: scale));
+    final gif = await _encodeGif(document, tag, scale);
+    await writeAtomically(_file(out), gif);
     say('Exported ${out.split('/').last} at $scale×');
     return out;
   }
+
+  static Future<Uint8List> _encodeGif(
+    SpriteDocument doc,
+    SpriteTag? tag,
+    int scale,
+  ) =>
+      Isolate.run(() => GifEncoder.encodeDocument(doc, tag: tag, scale: scale));
 
   /// Opens [relativePath]: a `.jsprite` project, or an image to start one
   /// from. [decodeImage] turns image bytes into pixels (the UI supplies it;
@@ -470,12 +622,16 @@ class SpriteStudioSession {
       );
     }
     final image = await decodeImage(await file.readAsBytes());
-    return SpriteStudioSession(
+    final session = SpriteStudioSession(
       SheetImporter.fromImage(image),
       path: sibling,
       root: base,
-    )..say(
-      'Imported ${relativePath.split('/').last} — saving makes a project.',
+    );
+    return session..say(
+      session.document.fitsForSaving
+          ? 'Imported ${relativePath.split('/').last} — saving makes a '
+                'project.'
+          : session.tooBigToSaveMessage,
     );
   }
 
@@ -483,6 +639,7 @@ class SpriteStudioSession {
     stop();
     for (final s in <Signal<Object?>>[
       revision,
+      structureRevision,
       layerIndex,
       frameIndex,
       tool,

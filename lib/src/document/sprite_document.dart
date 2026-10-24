@@ -127,7 +127,8 @@ class DocumentStructure {
 /// cel — a canvas-sized buffer — wherever a layer has something in a frame.
 class SpriteDocument {
   SpriteDocument({required this.width, required this.height})
-    : assert(width > 0 && height > 0);
+    : assert(width > 0 && height > 0),
+      assert(width <= maxImportSize && height <= maxImportSize);
 
   /// A blank sprite with one layer and one frame.
   factory SpriteDocument.blank(int width, int height, {List<int>? palette}) {
@@ -139,10 +140,20 @@ class SpriteDocument {
     return doc;
   }
 
+  /// The largest sprite, either way, that can be saved — and so opened
+  /// again.
   static const int maxSize = 2048;
+
+  /// The largest image, either way, that can be brought in at all: a sheet
+  /// bigger than [maxSize] opens so that it can be cut into frames, but
+  /// cannot be saved until it fits ([fitsForSaving]).
+  static const int maxImportSize = 8192;
 
   int width;
   int height;
+
+  /// Whether this sprite is small enough to save: no side over [maxSize].
+  bool get fitsForSaving => width <= maxSize && height <= maxSize;
 
   /// Bottom first.
   final List<SpriteLayer> layers = [];
@@ -163,8 +174,11 @@ class SpriteDocument {
 
   IntRect get bounds => IntRect(0, 0, width, height);
 
-  // Ids are small positive ints, so a pair packs into one key.
-  static int _key(int layerId, int frameId) => layerId * 0x100000 + frameId;
+  /// Layer and frame ids are from 1 up to below this, so that a pair packs
+  /// into one key.
+  static const int idLimit = 0x100000;
+
+  static int _key(int layerId, int frameId) => layerId * idLimit + frameId;
 
   // ── Cels ─────────────────────────────────────────────────────────────────
 
@@ -360,6 +374,23 @@ class SpriteDocument {
     return out;
   }
 
+  /// The one pixel ([x], [y]) of [flatten]`(frameIndex)`, without drawing
+  /// the rest of the frame: what a colour picker reads.
+  int pixelAt(int frameIndex, int x, int y, {bool onlyVisible = true}) {
+    if (frameIndex < 0 || frameIndex >= frames.length) return 0;
+    if (x < 0 || y < 0 || x >= width || y >= height) return 0;
+    final frameId = frames[frameIndex].id;
+    var out = Argb.transparent;
+    for (final l in layers) {
+      if (onlyVisible && !l.visible) continue;
+      final c = cel(l.id, frameId);
+      if (c == null || l.opacity <= 0) continue;
+      final p = c.pixels[y * width + x];
+      if (p >> 24 != 0) out = Argb.over(out, p, l.opacity);
+    }
+    return out;
+  }
+
   // ── Whole-canvas changes ─────────────────────────────────────────────────
 
   /// Replaces every cel with [change] of it and adopts the new size. Used
@@ -401,6 +432,53 @@ class SpriteDocument {
 
   void rotateCanvas({bool clockwise = true}) =>
       transformCanvas(height, width, (c) => c.rotated90(clockwise: clockwise));
+
+  /// Becomes [other]: its size, layers, frames, cels, tags, palette and
+  /// export options. Layers and frames get new ids from this document, so
+  /// no id that ever meant something else here comes back. [other] is left
+  /// as it was; its cels are taken, not copied.
+  ///
+  /// Through [DocumentEditor.structural] this is one undo step — how a
+  /// sheet is cut into frames in place.
+  void replaceWith(SpriteDocument other) {
+    final layerIds = <int, int>{for (final l in other.layers) l.id: _nextId++};
+    final frameIds = <int, int>{for (final f in other.frames) f.id: _nextId++};
+    width = other.width;
+    height = other.height;
+    layers
+      ..clear()
+      ..addAll([
+        for (final l in other.layers)
+          SpriteLayer(
+            id: layerIds[l.id]!,
+            name: l.name,
+            visible: l.visible,
+            locked: l.locked,
+            opacity: l.opacity,
+          ),
+      ]);
+    frames
+      ..clear()
+      ..addAll([
+        for (final f in other.frames)
+          SpriteFrame(id: frameIds[f.id]!, durationMs: f.durationMs),
+      ]);
+    tags
+      ..clear()
+      ..addAll([for (final t in other.tags) t.clone()]);
+    palette
+      ..clear()
+      ..addAll(other.palette);
+    exportOptions = other.exportOptions;
+    _cels.clear();
+    for (final l in other.layers) {
+      for (final f in other.frames) {
+        final c = other.cel(l.id, f.id);
+        if (c != null) _cels[_key(layerIds[l.id]!, frameIds[f.id]!)] = c;
+      }
+    }
+    touch();
+  }
 
   /// Drops cels with nothing in them.
   void pruneBlankCels() {

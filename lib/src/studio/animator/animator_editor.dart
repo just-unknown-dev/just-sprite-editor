@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -9,6 +10,7 @@ import 'package:just_editor_core/just_editor_core.dart'
     show CommitTextField, EditorKeys;
 import 'package:just_signals/just_signals.dart';
 
+import '../studio_files.dart';
 import '../studio_panels.dart';
 import '../studio_theme.dart';
 import 'animator_session.dart';
@@ -140,21 +142,59 @@ class AnimatorGraphEditorState extends State<AnimatorGraphEditor> {
     if (s == null) return;
     var target = s.path;
     if (target == null) {
+      const ext = '.${AnimatorGraphSession.extension}';
+      final folder = '${s.root}/${widget.newGraphFolder}';
       final name = await promptForText(
         context,
         title: 'Name this animator',
-        initial: 'character',
+        // A name no graph has yet: taking the one offered never writes
+        // over another.
+        initial: freeStem(folder, 'character', const [ext]),
       );
-      if (name == null || name.isEmpty) return;
-      final safe = name.replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_');
-      target =
-          '${widget.newGraphFolder}/$safe.${AnimatorGraphSession.extension}';
+      if (name == null || name.isEmpty || !mounted) return;
+      final safe = safeFileName(name);
+      target = '${widget.newGraphFolder}/$safe$ext';
+      if (File('$folder/$safe$ext').existsSync() &&
+          !await _mayReplace('$safe$ext')) {
+        return;
+      }
     }
     try {
       widget.onSaved?.call(await s.save(to: target));
     } catch (e) {
       _showToast('Could not save: $e');
     }
+  }
+
+  /// Whether saving may write over [file], another graph's.
+  Future<bool> _mayReplace(String file) async {
+    if (!mounted) return false;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: StudioTheme.panel,
+        title: Text(
+          'Replace $file?',
+          style: StudioTheme.body.copyWith(fontSize: 13),
+        ),
+        content: Text(
+          'Another animator graph is saved there. Saving writes over it, '
+          'and that cannot be undone.',
+          style: StudioTheme.body,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Replace'),
+          ),
+        ],
+      ),
+    );
+    return ok ?? false;
   }
 
   /// Whether it is fine to go: nothing unsaved, or the author said what
@@ -224,8 +264,8 @@ class AnimatorGraphEditorState extends State<AnimatorGraphEditor> {
     } else if (key == LogicalKeyboardKey.escape) {
       setState(() => _linkFrom = null);
       s.selection.value = null;
-    } else if (key == LogicalKeyboardKey.delete ||
-        key == LogicalKeyboardKey.backspace) {
+    } else if (EditorKeys.isDeleteKey(key)) {
+      // Delete, and the Mac's delete key (Backspace), as across the editor.
       final sel = s.selection.value;
       if (sel?.state != null) s.removeState(sel!.state!);
       if (sel?.transition != null) s.removeTransition(sel!.transition!);
@@ -317,7 +357,9 @@ class AnimatorGraphEditorState extends State<AnimatorGraphEditor> {
                         child: _Inspector(
                           key: ValueKey(s.selection.value),
                           session: s,
-                          clips: s.readClipNames(),
+                          // Kept between rebuilds: not read from disk on
+                          // every drag tick.
+                          clips: s.clipNames(),
                         ),
                       ),
                     ],
@@ -502,20 +544,27 @@ class AnimatorGraphEditorState extends State<AnimatorGraphEditor> {
       height: rect.height,
       child: GestureDetector(
         onTap: () => _tapNode(node),
+        // From where the node is now, not where it was at the last build:
+        // several moves can arrive before the next one.
         onPanUpdate: state == null
             ? null
-            : (d) => s.moveState(
-                node,
-                state.x + d.delta.dx,
-                state.y + d.delta.dy,
-                commit: false,
-              ),
+            : (d) {
+                final now = s.g.stateNamed(node);
+                if (now == null) return;
+                s.moveState(
+                  node,
+                  now.x + d.delta.dx,
+                  now.y + d.delta.dy,
+                  commit: false,
+                );
+              },
         onPanEnd: state == null
             ? null
             : (_) {
-                final now = s.g.stateNamed(node)!;
-                s.moveState(node, now.x, now.y, commit: true);
+                final now = s.g.stateNamed(node);
+                if (now != null) s.moveState(node, now.x, now.y, commit: true);
               },
+        onPanCancel: state == null ? null : () => s.endMove(node),
         child: Container(
           decoration: BoxDecoration(
             color: live
@@ -724,7 +773,9 @@ class _ArrowPainter extends CustomPainter {
       textDirection: TextDirection.ltr,
     )..layout();
     final mid = (a + b) / 2 + normal * 9;
-    text.paint(canvas, mid - Offset(text.width / 2, text.height / 2));
+    text
+      ..paint(canvas, mid - Offset(text.width / 2, text.height / 2))
+      ..dispose();
   }
 
   @override

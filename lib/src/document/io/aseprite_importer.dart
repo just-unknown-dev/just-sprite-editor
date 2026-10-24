@@ -15,11 +15,21 @@ import '../sprite_document.dart';
 /// pixels, tilemap layers and blend modes other than normal are ignored.
 /// [warnings] says which of those happened.
 class AsepriteImporter {
-  AsepriteImporter._(this._data) : _view = ByteData.sublistView(_data);
+  AsepriteImporter._(this._data)
+    : _view = ByteData.sublistView(_data),
+      _end = _data.length;
 
   final Uint8List _data;
   final ByteData _view;
   int _at = 0;
+
+  /// Where reading must stop: the end of the chunk being read, of its
+  /// frame, or of the file. Every read checks it, so a size in the file
+  /// that is a lie is a damaged file, not a read past the end.
+  int _end;
+
+  /// Bytes of canvas-sized cels built so far, against [maxCelBytes].
+  int _celBytes = 0;
 
   /// What could not be carried over, in words for the artist.
   final List<String> warnings = [];
@@ -27,30 +37,60 @@ class AsepriteImporter {
   static const int _fileMagic = 0xA5E0;
   static const int _frameMagic = 0xF1FA;
 
-  /// Throws [FormatException] when [bytes] is not an Aseprite file.
+  /// The most memory an import may give its cels — each is a canvas-sized
+  /// buffer — before the file is refused as too big to open.
+  static const int maxCelBytes = 1 << 30;
+
+  /// The most pixels one cel of the file may hold.
+  static const int maxCelPixels = 4096 * 4096;
+
+  /// The most layers a file may have.
+  static const int maxLayers = 4096;
+
+  static const FormatException _damaged = FormatException(
+    'This Aseprite file is damaged.',
+  );
+
+  /// Throws [FormatException] when [bytes] is not an Aseprite file, is
+  /// damaged or cut short, or is too big to open.
   static (SpriteDocument, List<String> warnings) import(List<int> bytes) {
     final importer = AsepriteImporter._(
       bytes is Uint8List ? bytes : Uint8List.fromList(bytes),
     );
-    final doc = importer._read();
-    return (doc, importer.warnings);
+    try {
+      final doc = importer._read();
+      return (doc, importer.warnings);
+    } on RangeError {
+      // Every read is bounded; this is the net under them.
+      throw _damaged;
+    }
   }
 
-  int _u8() => _view.getUint8(_at++);
+  void _need(int bytes) {
+    if (_at < 0 || _at + bytes > _end) throw _damaged;
+  }
+
+  int _u8() {
+    _need(1);
+    return _view.getUint8(_at++);
+  }
 
   int _u16() {
+    _need(2);
     final v = _view.getUint16(_at, Endian.little);
     _at += 2;
     return v;
   }
 
   int _i16() {
+    _need(2);
     final v = _view.getInt16(_at, Endian.little);
     _at += 2;
     return v;
   }
 
   int _u32() {
+    _need(4);
     final v = _view.getUint32(_at, Endian.little);
     _at += 4;
     return v;
@@ -58,12 +98,25 @@ class AsepriteImporter {
 
   String _string() {
     final length = _u16();
+    _need(length);
     final s = utf8.decode(
-      _data.sublist(_at, _at + length),
+      Uint8List.sublistView(_data, _at, _at + length),
       allowMalformed: true,
     );
     _at += length;
     return s;
+  }
+
+  /// Counts one more canvas-sized cel against [maxCelBytes], before it is
+  /// made.
+  void _chargeCel(int width, int height) {
+    _celBytes += width * height * 4;
+    if (_celBytes > maxCelBytes) {
+      throw const FormatException(
+        'This Aseprite file is too big to open: its cels would need more '
+        'than ${maxCelBytes >> 20} MB.',
+      );
+    }
   }
 
   void _warn(String text) {
@@ -95,6 +148,8 @@ class AsepriteImporter {
     if (depth != 32 && depth != 16 && depth != 8) {
       throw FormatException('Unknown colour depth: $depth bits.');
     }
+    // Every frame is at least its 16-byte header.
+    if (frameCount * 16 > _data.length - 128) throw _damaged;
     if (depth == 8) _warn('Indexed colours became RGBA.');
     if (depth == 16) _warn('Greyscale became RGBA.');
     final layerOpacityValid = flags & 1 != 0;
@@ -114,15 +169,23 @@ class AsepriteImporter {
 
     for (var f = 0; f < frameCount; f++) {
       final frameStart = _at;
+      _end = _data.length;
       final frameBytes = _u32();
-      if (_u16() != _frameMagic) {
+      final frameEnd = frameStart + frameBytes;
+      if (_u16() != _frameMagic || frameBytes < 16 || frameEnd > _data.length) {
         throw FormatException('Frame ${f + 1} is damaged.');
       }
+      _end = frameEnd;
       final oldChunks = _u16();
       final duration = _u16();
       _at += 2;
       final newChunks = _u32();
       final chunks = newChunks == 0 ? oldChunks : newChunks;
+      // Every chunk is at least its 6-byte header: a count the frame cannot
+      // hold is damage, not a reason to read the same bytes again.
+      if (chunks > (frameEnd - _at) ~/ 6) {
+        throw FormatException('Frame ${f + 1} is damaged.');
+      }
       final frame = doc.addFrame(
         durationMs: duration > 0
             ? duration
@@ -133,9 +196,12 @@ class AsepriteImporter {
 
       for (var c = 0; c < chunks; c++) {
         final chunkStart = _at;
+        _end = frameEnd;
         final size = _u32();
         final type = _u16();
         final chunkEnd = chunkStart + size;
+        if (size < 6 || chunkEnd > frameEnd) throw _damaged;
+        _end = chunkEnd;
         switch (type) {
           case 0x2004:
             final layerFlags = _u16();
@@ -145,6 +211,12 @@ class AsepriteImporter {
             final opacity = _u8();
             _at += 3;
             final name = _string();
+            if (layers.length >= maxLayers) {
+              throw const FormatException(
+                'This Aseprite file has more layers than the studio opens '
+                '($maxLayers).',
+              );
+            }
             isBackground.add(layerFlags & 8 != 0);
             if (layerType == 1) {
               _warn('Layer groups were flattened away.');
@@ -176,18 +248,22 @@ class AsepriteImporter {
             if (celType == 1) {
               final linked = placed[layerIndex * 0x10000 + _u16()];
               if (linked != null && layer != null) {
+                _chargeCel(width, height);
                 doc.setCel(layer.id, frame.id, linked.copy());
                 placed[layerIndex * 0x10000 + f] = linked;
               }
               break;
             } else if (celType == 0 || celType == 2) {
               final w = _u16(), h = _u16();
+              if (w * h > maxCelPixels) {
+                throw const FormatException(
+                  'A cel in this file is too big to open.',
+                );
+              }
+              final data = Uint8List.sublistView(_data, _at, chunkEnd);
               final raw = celType == 0
-                  ? _data.sublist(_at, chunkEnd)
-                  : _inflate(
-                      _data.sublist(_at, chunkEnd),
-                      w * h * (depth ~/ 8),
-                    );
+                  ? data
+                  : _inflate(data, w * h * (depth ~/ 8));
               image = _decodePixels(
                 raw,
                 w,
@@ -211,6 +287,7 @@ class AsepriteImporter {
                 image.pixels[i] = (p & 0x00FFFFFF) | (a << 24);
               }
             }
+            _chargeCel(width, height);
             final cel = PixelBuffer(width, height)..paste(image, ox, oy);
             doc.setCel(layer.id, frame.id, cel);
             placed[layerIndex * 0x10000 + f] = cel;
@@ -277,7 +354,7 @@ class AsepriteImporter {
         }
         _at = chunkEnd;
       }
-      _at = frameStart + frameBytes;
+      _at = frameEnd;
     }
 
     if (doc.layers.isEmpty) doc.addLayer(name: 'Layer 1');
@@ -321,11 +398,12 @@ class AsepriteImporter {
     List<int> palette,
     int transparentIndex,
   ) {
-    final out = PixelBuffer(w, h);
     final bytesPerPixel = depth ~/ 8;
+    // Checked before anything the size of the cel is made.
     if (raw.length < w * h * bytesPerPixel) {
       throw const FormatException('A cel in this file is damaged.');
     }
+    final out = PixelBuffer(w, h);
     for (var i = 0, o = 0; i < w * h; i++, o += bytesPerPixel) {
       out.pixels[i] = switch (depth) {
         32 => Argb.from(raw[o + 3], raw[o], raw[o + 1], raw[o + 2]),

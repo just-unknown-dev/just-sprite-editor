@@ -1,8 +1,9 @@
 /// Plugs the Sprite Studio into `just_game_engine_editor`.
 ///
-/// Design-time only: a game imports `package:just_sprite_editor/
-/// just_sprite_editor.dart` if it wants the studio's widgets, and never this
-/// library — so nothing of the editor reaches a release build through here.
+/// Design-time only, as is every library of this package: a game imports
+/// none of them — the engine plays the sheets, atlases and animator graphs
+/// the studio saves — so nothing of the editor reaches a release build.
+/// Installed from the Asset Store, the module registers itself.
 library;
 
 import 'package:flutter/material.dart';
@@ -13,8 +14,14 @@ import 'just_sprite_editor.dart';
 import 'src/studio/studio_theme.dart';
 
 /// Adds the Sprite Studio to the editor: a workspace that opens images and
-/// `.jsprite` projects, another for `.animator.json` state machines, "Edit" and "New sprite" in the Assets dock, a toolbar
-/// button, and an "Animated sprite" prefab for the Level Designer.
+/// `.jsprite` projects, another for `.animator.json` state machines, "Edit"
+/// and "New sprite" in the Assets dock, a toolbar button, and the
+/// "Animated sprite" and "Animated character" prefabs for the Level
+/// Designer.
+///
+/// Installed from the Asset Store it is registered for you (through the
+/// generated `lib/editor/store_modules.g.dart`). In a project without the
+/// store, hand it to the editor yourself:
 ///
 /// ```dart
 /// JustGameEditorPlugin.register(

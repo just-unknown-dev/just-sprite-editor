@@ -1,6 +1,7 @@
 // Art coming in from Aseprite, and animations going out as GIFs.
 
 import 'dart:io' show ZLibEncoder;
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -247,6 +248,144 @@ void main() {
         () => AsepriteImporter.import(Uint8List(200)),
         throwsFormatException,
       );
+    });
+
+    // Damaged files: each says so, at once, rather than reading past the
+    // end, reading the same bytes for ever or making something huge.
+    group('a damaged file', () {
+      Uint8List valid() =>
+          (_Ase(4, 3)
+                ..layer('Body')
+                ..tags([('idle', 0, 1, 0, 0)])
+                ..cel(0, 1, 1, 2, 1, _rgba([_red, _blue]))
+                ..endFrame(120)
+                ..linkedCel(0, 0)
+                ..cel(0, 0, 0, 1, 1, _rgba([_blue]), compressed: false)
+                ..endFrame(80))
+              .build();
+
+      /// The 128-byte header of a file with [frames] frames, then [body].
+      Uint8List file(int frames, List<int> body) {
+        final header = [
+          ..._Ase.u32(128 + body.length),
+          ..._Ase.u16(0xA5E0),
+          ..._Ase.u16(frames),
+          ..._Ase.u16(4),
+          ..._Ase.u16(4),
+          ..._Ase.u16(32),
+          ..._Ase.u32(1),
+          ..._Ase.u16(100),
+        ];
+        return Uint8List.fromList([
+          ...header,
+          ...List.filled(128 - header.length, 0),
+          ...body,
+        ]);
+      }
+
+      List<int> frameHeader(int bytes, int chunks) => [
+        ..._Ase.u32(bytes),
+        ..._Ase.u16(0xF1FA),
+        ..._Ase.u16(chunks > 0xFFFF ? 0xFFFF : chunks),
+        ..._Ase.u16(100),
+        0,
+        0,
+        ..._Ase.u32(chunks),
+      ];
+
+      test('cut short anywhere', () {
+        final bytes = valid();
+        expect(AsepriteImporter.import(bytes).$1.frames, hasLength(2));
+        for (var n = 0; n < bytes.length; n++) {
+          expect(
+            () => AsepriteImporter.import(Uint8List.sublistView(bytes, 0, n)),
+            throwsFormatException,
+            reason: 'cut at $n of ${bytes.length}',
+          );
+        }
+      });
+
+      test('a chunk of size 0 that the frame says comes billions of times', () {
+        final chunk = [..._Ase.u32(0), ..._Ase.u16(0x2004)];
+        final body = [...frameHeader(16 + chunk.length, 0xFFFFFFFF), ...chunk];
+        expect(
+          () => AsepriteImporter.import(file(1, body)),
+          throwsFormatException,
+        );
+      });
+
+      test('a chunk bigger than its frame', () {
+        final chunk = [..._Ase.u32(4000), ..._Ase.u16(0x2004)];
+        final body = [...frameHeader(16 + chunk.length, 1), ...chunk];
+        expect(
+          () => AsepriteImporter.import(file(1, body)),
+          throwsFormatException,
+        );
+      });
+
+      test('a frame of size 0, said to come 65535 times', () {
+        final body = [...frameHeader(0, 0), ...List.filled(64, 0)];
+        expect(
+          () => AsepriteImporter.import(file(0xFFFF, body)),
+          throwsFormatException,
+        );
+        expect(
+          () => AsepriteImporter.import(file(1, body)),
+          throwsFormatException,
+        );
+      });
+
+      test('a cel that claims to be 65535 × 65535', () {
+        final cel = [
+          ..._Ase.u16(0), // layer
+          ..._Ase.u16(0),
+          ..._Ase.u16(0),
+          255,
+          ..._Ase.u16(0), // raw
+          ..._Ase.u16(0),
+          0, 0, 0, 0, 0,
+          ..._Ase.u16(0xFFFF),
+          ..._Ase.u16(0xFFFF),
+          1, 2, 3, 4,
+        ];
+        final layer = (_Ase(4, 4)..layer('L'))._chunks.single;
+        final chunk = [
+          ..._Ase.u32(cel.length + 6),
+          ..._Ase.u16(0x2005),
+          ...cel,
+        ];
+        final body = [
+          ...frameHeader(16 + layer.length + chunk.length, 2),
+          ...layer,
+          ...chunk,
+        ];
+        expect(
+          () => AsepriteImporter.import(file(1, body)),
+          throwsA(
+            isA<FormatException>().having(
+              (e) => e.message,
+              'message',
+              contains('too big'),
+            ),
+          ),
+        );
+      });
+
+      test('any byte changed: it opens, or says it cannot', () {
+        final bytes = valid();
+        final random = math.Random(7);
+        for (var i = 0; i < 1500; i++) {
+          final damaged = Uint8List.fromList(bytes);
+          for (var k = 0; k < 1 + random.nextInt(3); k++) {
+            damaged[random.nextInt(damaged.length)] = random.nextInt(256);
+          }
+          try {
+            AsepriteImporter.import(damaged);
+          } on FormatException {
+            // Said so: fine.
+          }
+        }
+      }, timeout: const Timeout(Duration(seconds: 30)));
     });
 
     // The fixtures compress with dart:io, which is zlib itself, so every

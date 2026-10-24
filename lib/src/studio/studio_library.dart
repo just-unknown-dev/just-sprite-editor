@@ -6,10 +6,12 @@
 library;
 
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
+import 'studio_files.dart';
 import 'studio_panels.dart';
 import 'studio_theme.dart';
 
@@ -80,6 +82,13 @@ class SpriteLibrary {
     return out;
   }
 
+  /// [scan], away from the UI thread: a large `assets` folder takes a
+  /// while to walk.
+  Future<List<SpriteAsset>> scanInBackground() {
+    final library = SpriteLibrary(root: root, folder: folder);
+    return Isolate.run(library.scan);
+  }
+
   /// Copies [from] into [into], under a name nothing else has, and gives
   /// back its project-relative path.
   ///
@@ -95,17 +104,24 @@ class SpriteLibrary {
     return '$into/$unique';
   }
 
-  /// [name], or `name_2`, `name_3`… when it is taken.
-  String _free(String name, {required String in_}) {
-    if (!File('$in_/$name').existsSync()) return name;
+  /// [name], or `name_2`, `name_3`… when it is taken — and taken means
+  /// anything a sprite of that name is, or saves: a project beside an
+  /// imported `hero.aseprite` is opened instead of it, and a sheet or atlas
+  /// of that name is one saving it would write over.
+  static String _free(String name, {required String in_}) {
     final dot = name.lastIndexOf('.');
     final stem = dot < 0 ? name : name.substring(0, dot);
     final ext = dot < 0 ? '' : name.substring(dot);
-    for (var i = 2; i < 1000; i++) {
-      if (!File('$in_/${stem}_$i$ext').existsSync()) return '${stem}_$i$ext';
-    }
-    return '${stem}_${DateTime.now().millisecondsSinceEpoch}$ext';
+    return '${freeStem(in_, stem, [ext, for (final e in _sprite) '.$e'])}$ext';
   }
+
+  static const List<String> _sprite = [
+    kProjectExtension,
+    'png',
+    'json',
+    'aseprite',
+    'ase',
+  ];
 }
 
 /// Asks for a sprite anywhere on disk. Null when nothing was chosen.

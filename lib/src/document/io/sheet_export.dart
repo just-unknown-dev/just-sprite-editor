@@ -26,6 +26,12 @@ class SheetExport {
 /// already reads — plus a `meta.just` block for what that format cannot say:
 /// which clips do not loop, and frame events.
 abstract final class SheetExporter {
+  /// The widest or tallest sheet [export] makes: past this a GPU will not
+  /// take it as one texture, so the game could not show it.
+  static const int maxSheetSize = 16384;
+
+  /// Throws [ArgumentError] when the sheet would be bigger than
+  /// [maxSheetSize] either way.
   static SheetExport export(
     SpriteDocument doc, {
     required String name,
@@ -49,12 +55,14 @@ abstract final class SheetExporter {
 
     final cellW = images.fold(0, (m, i) => math.max(m, i.width));
     final cellH = images.fold(0, (m, i) => math.max(m, i.height));
-    final columns = switch (options.layout) {
-      SheetLayout.horizontal => count,
-      SheetLayout.vertical => 1,
-      SheetLayout.grid => math.max(1, math.sqrt(count).ceil()),
-    };
-    final rows = (count / columns).ceil();
+    final (columns, rows) = _grid(options.layout, count);
+    final size = (
+      (pad + columns * (cellW + pad)) * scale,
+      (pad + rows * (cellH + pad)) * scale,
+    );
+    if (size.$1 > maxSheetSize || size.$2 > maxSheetSize) {
+      throw ArgumentError(_tooBig(size));
+    }
     final sheet = PixelBuffer(
       pad + columns * (cellW + pad),
       pad + rows * (cellH + pad),
@@ -124,6 +132,20 @@ abstract final class SheetExporter {
     });
   }
 
+  static (int columns, int rows) _grid(SheetLayout layout, int count) {
+    final columns = switch (layout) {
+      SheetLayout.horizontal => count,
+      SheetLayout.vertical => 1,
+      SheetLayout.grid => math.max(1, math.sqrt(count).ceil()),
+    };
+    return (columns, (count / columns).ceil());
+  }
+
+  static String _tooBig((int, int) size) =>
+      'The sheet would be ${size.$1} × ${size.$2}, more than a game can '
+      'load ($maxSheetSize either way). Lay it out as a grid, or export it '
+      'at a smaller scale.';
+
   static Map<String, int> _rect(int x, int y, int w, int h, int scale) => {
     'x': x * scale,
     'y': y * scale,
@@ -134,12 +156,37 @@ abstract final class SheetExporter {
 
 /// Brings existing art in.
 abstract final class SheetImporter {
-  /// One image as a one-frame sprite.
+  /// One image as a one-frame sprite, exported without padding: saved
+  /// untouched, the sheet is the same picture at the same size, so
+  /// whatever else uses that PNG — a tile map, a background — still lines
+  /// up.
+  ///
+  /// Throws [FormatException] for an image larger than
+  /// [SpriteDocument.maxImportSize] either way. One larger than
+  /// [SpriteDocument.maxSize] opens, but must be cut into frames (or
+  /// cropped) before it can be saved.
   static SpriteDocument fromImage(PixelBuffer image) {
-    final doc = SpriteDocument.blank(image.width, image.height);
+    checkImportSize(image.width, image.height);
+    final doc = SpriteDocument.blank(image.width, image.height)
+      ..exportOptions = const SheetExportOptions();
     doc.setCel(doc.layers.first.id, doc.frames.first.id, image.copy());
     doc.revision = 0;
     return doc;
+  }
+
+  /// Throws [FormatException] when an image of [width] × [height] is too
+  /// big to open ([SpriteDocument.maxImportSize]), or empty.
+  static void checkImportSize(int width, int height) {
+    const most = SpriteDocument.maxImportSize;
+    if (width < 1 || height < 1) {
+      throw const FormatException('The image is empty.');
+    }
+    if (width > most || height > most) {
+      throw FormatException(
+        'The image is $width × $height; the studio opens images up to '
+        '$most × $most.',
+      );
+    }
   }
 
   /// A sheet cut into frames of [frameWidth] × [frameHeight], reading rows
@@ -157,6 +204,16 @@ abstract final class SheetImporter {
   }) {
     if (frameWidth <= 0 || frameHeight <= 0) {
       throw ArgumentError('A frame must be at least 1 × 1.');
+    }
+    if (margin < 0 || spacing < 0) {
+      throw ArgumentError('Margin and spacing cannot be negative.');
+    }
+    if (frameWidth > SpriteDocument.maxSize ||
+        frameHeight > SpriteDocument.maxSize) {
+      throw ArgumentError(
+        'A frame can be at most ${SpriteDocument.maxSize} × '
+        '${SpriteDocument.maxSize}.',
+      );
     }
     final doc = SpriteDocument(width: frameWidth, height: frameHeight);
     final layer = doc.addLayer(name: 'Layer 1');

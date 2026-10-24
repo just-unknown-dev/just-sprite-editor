@@ -24,7 +24,7 @@ class TimelinePanel extends StatelessWidget {
     final s = session;
     return SignalConsumer(
       signals: [
-        s.revision,
+        s.structureRevision,
         s.frameIndex,
         s.layerIndex,
         s.isPlaying,
@@ -264,8 +264,8 @@ class _CelCell extends StatelessWidget {
   Widget build(BuildContext context) {
     final s = session;
     final doc = s.document;
-    final cel = doc.cel(doc.layers[layer].id, doc.frames[frame].id);
-    final hasArt = cel != null && !cel.isBlank;
+    // Worked out once per change to the sprite, not on every rebuild.
+    final hasArt = s.celHasArt(doc.layers[layer].id, doc.frames[frame].id);
     final active = layer == s.layerIndex.value && frame == s.frameIndex.value;
     final inRowOrColumn =
         layer == s.layerIndex.value || frame == s.frameIndex.value;
@@ -459,113 +459,38 @@ class _DurationField extends StatelessWidget {
   );
 }
 
-/// The tag editor: name, range, direction, whether it loops, and its events.
+//// The tag editor: name, range, direction, whether it loops, and its events.
 Future<void> editTag(
   BuildContext context,
   SpriteStudioSession s,
   int index,
 ) async {
   final tag = s.document.tags[index];
-  final name = TextEditingController(text: tag.name);
-  final from = TextEditingController(text: '${tag.from + 1}');
-  final to = TextEditingController(text: '${tag.to + 1}');
-  final events = TextEditingController(
-    text: [for (final e in tag.events) '${e.timeMs}:${e.name}'].join(', '),
-  );
-  var direction = tag.direction;
-  var loop = tag.loop;
-
-  final result = await showDialog<String>(
+  final result = await showDialog<_TagEdit>(
     context: context,
-    builder: (context) => StatefulBuilder(
-      builder: (context, setState) => AlertDialog(
-        backgroundColor: StudioTheme.panel,
-        title: Text('Tag', style: StudioTheme.body.copyWith(fontSize: 13)),
-        content: SizedBox(
-          width: 300,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              _field('Name — the clip the game plays', name),
-              Row(
-                children: [
-                  Expanded(child: _field('From frame', from)),
-                  const SizedBox(width: 8),
-                  Expanded(child: _field('To frame', to)),
-                ],
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  for (final d in TagDirection.values)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 4),
-                      child: ChoiceChip(
-                        label: Text(d.name, style: StudioTheme.label),
-                        selected: direction == d,
-                        onSelected: (_) => setState(() => direction = d),
-                      ),
-                    ),
-                ],
-              ),
-              CheckboxListTile(
-                value: loop,
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                controlAffinity: ListTileControlAffinity.leading,
-                title: Text('Loops', style: StudioTheme.body),
-                subtitle: Text(
-                  'Off for a jump or a hit: it plays once and holds.',
-                  style: StudioTheme.label,
-                ),
-                onChanged: (v) => setState(() => loop = v ?? true),
-              ),
-              _field('Events — "120:step, 300:land" (ms:name)', events),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop('delete'),
-            child: Text(
-              'Delete tag',
-              style: TextStyle(color: StudioTheme.danger),
-            ),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(context).pop('ok'),
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-    ),
+    builder: (context) => _TagDialog(tag: tag),
   );
-  if (result == 'delete') {
+  if (result == null) return;
+  if (result.delete) {
     s.structural('Delete tag', (d) => d.tags.removeAt(index));
     return;
   }
-  if (result != 'ok') return;
 
   final last = s.document.frames.length - 1;
-  final a = ((int.tryParse(from.text.trim()) ?? tag.from + 1) - 1).clamp(
+  final a = ((int.tryParse(result.from.trim()) ?? tag.from + 1) - 1).clamp(
     0,
     last,
   );
-  final b = ((int.tryParse(to.text.trim()) ?? tag.to + 1) - 1).clamp(0, last);
+  final b = ((int.tryParse(result.to.trim()) ?? tag.to + 1) - 1).clamp(0, last);
   final parsed = <SpriteEvent>[
-    for (final part in events.text.split(','))
+    for (final part in result.events.split(','))
       if (part.contains(':'))
         SpriteEvent(
           timeMs: int.tryParse(part.split(':').first.trim()) ?? 0,
           name: part.substring(part.indexOf(':') + 1).trim(),
         ),
   ]..sort((x, y) => x.timeMs.compareTo(y.timeMs));
-  final wanted = name.text.trim().isEmpty ? tag.name : name.text.trim();
+  final wanted = result.name.trim().isEmpty ? tag.name : result.name.trim();
   final taken = s.document.tags.any((t) => t != tag && t.name == wanted);
   if (taken) s.say('Another tag is already called "$wanted".');
   s.structural('Edit tag', (d) {
@@ -573,10 +498,143 @@ Future<void> editTag(
       ..name = taken ? tag.name : wanted
       ..from = a < b ? a : b
       ..to = a < b ? b : a
-      ..direction = direction
-      ..loop = loop
+      ..direction = result.direction
+      ..loop = result.loop
       ..events = parsed.where((e) => e.name.isNotEmpty).toList();
   });
+}
+
+/// What the tag dialog was left with: its fields as typed, or Delete.
+class _TagEdit {
+  const _TagEdit({
+    this.delete = false,
+    this.name = '',
+    this.from = '',
+    this.to = '',
+    this.events = '',
+    this.direction = TagDirection.forward,
+    this.loop = true,
+  });
+
+  final bool delete;
+  final String name;
+  final String from;
+  final String to;
+  final String events;
+  final TagDirection direction;
+  final bool loop;
+}
+
+/// The tag dialog. It owns its fields' controllers, so they go when it
+/// does — after its closing animation, not before.
+class _TagDialog extends StatefulWidget {
+  const _TagDialog({required this.tag});
+
+  final SpriteTag tag;
+
+  @override
+  State<_TagDialog> createState() => _TagDialogState();
+}
+
+class _TagDialogState extends State<_TagDialog> {
+  late final TextEditingController _name = TextEditingController(
+    text: widget.tag.name,
+  );
+  late final TextEditingController _from = TextEditingController(
+    text: '${widget.tag.from + 1}',
+  );
+  late final TextEditingController _to = TextEditingController(
+    text: '${widget.tag.to + 1}',
+  );
+  late final TextEditingController _events = TextEditingController(
+    text: [for (final e in widget.tag.events) '${e.timeMs}:${e.name}']
+        .join(', '),
+  );
+  late TagDirection _direction = widget.tag.direction;
+  late bool _loop = widget.tag.loop;
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _from.dispose();
+    _to.dispose();
+    _events.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    backgroundColor: StudioTheme.panel,
+    title: Text('Tag', style: StudioTheme.body.copyWith(fontSize: 13)),
+    content: SizedBox(
+      width: 300,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _field('Name — the clip the game plays', _name),
+          Row(
+            children: [
+              Expanded(child: _field('From frame', _from)),
+              const SizedBox(width: 8),
+              Expanded(child: _field('To frame', _to)),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              for (final d in TagDirection.values)
+                Padding(
+                  padding: const EdgeInsets.only(right: 4),
+                  child: ChoiceChip(
+                    label: Text(d.name, style: StudioTheme.label),
+                    selected: _direction == d,
+                    onSelected: (_) => setState(() => _direction = d),
+                  ),
+                ),
+            ],
+          ),
+          CheckboxListTile(
+            value: _loop,
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            controlAffinity: ListTileControlAffinity.leading,
+            title: Text('Loops', style: StudioTheme.body),
+            subtitle: Text(
+              'Off for a jump or a hit: it plays once and holds.',
+              style: StudioTheme.label,
+            ),
+            onChanged: (v) => setState(() => _loop = v ?? true),
+          ),
+          _field('Events — "120:step, 300:land" (ms:name)', _events),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () =>
+            Navigator.of(context).pop(const _TagEdit(delete: true)),
+        child: Text('Delete tag', style: TextStyle(color: StudioTheme.danger)),
+      ),
+      TextButton(
+        onPressed: () => Navigator.of(context).pop(),
+        child: const Text('Cancel'),
+      ),
+      TextButton(
+        onPressed: () => Navigator.of(context).pop(
+          _TagEdit(
+            name: _name.text,
+            from: _from.text,
+            to: _to.text,
+            events: _events.text,
+            direction: _direction,
+            loop: _loop,
+          ),
+        ),
+        child: const Text('OK'),
+      ),
+    ],
+  );
 }
 
 Widget _field(String label, TextEditingController controller) => Padding(

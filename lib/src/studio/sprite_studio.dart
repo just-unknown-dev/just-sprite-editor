@@ -11,6 +11,7 @@ import '../document/io/sheet_export.dart';
 import '../document/palettes.dart';
 import '../document/sprite_document.dart';
 import 'studio_canvas.dart';
+import 'studio_files.dart';
 import 'studio_library.dart';
 import 'studio_panels.dart';
 import 'studio_session.dart';
@@ -34,10 +35,15 @@ class SpriteStudio extends StatefulWidget {
     this.fullScreen,
     this.onToggleFullScreen,
     this.setCloseGuard,
+    this.pickFile,
   });
 
   /// Project-relative file to open.
   final String? path;
+
+  /// How Import… asks for a file from outside the project: the system's
+  /// Open dialog when null. Null back when nothing was chosen.
+  final Future<String?> Function()? pickFile;
 
   /// The project root; the working directory when null.
   final String? root;
@@ -116,15 +122,39 @@ class SpriteStudioState extends State<SpriteStudio> {
     if (_libraryOpen) _refreshLibrary();
   }
 
+  int _libraryTicket = 0;
+
+  /// Looks through the project for its sprites, away from the UI thread;
+  /// the list fills in when that is done.
   void _refreshLibrary() {
     if (!mounted) return;
-    setState(() => _library = _sprites.scan());
+    final ticket = ++_libraryTicket;
+    _sprites.scanInBackground().then((found) {
+      if (mounted && ticket == _libraryTicket) {
+        setState(() => _library = found);
+      }
+    }, onError: (Object _) {});
   }
 
-  /// Opens a sprite the project already holds.
-  Future<void> _openPath(String path) async {
-    if (_session?.path == path) return;
-    if (!await _mayDiscard()) return;
+  static String _describe(Object e) => e is FormatException ? e.message : '$e';
+
+  /// Says what went wrong: over the sprite that is open, or — with none
+  /// open — in its place.
+  void _showProblem(String text) {
+    if (!mounted) return;
+    if (_session == null) {
+      setState(() => _error = text);
+    } else {
+      _showToast(text);
+    }
+  }
+
+  /// Opens a sprite the project already holds. False when it did not:
+  /// the artist kept what was open, or the file could not be read (which
+  /// it says).
+  Future<bool> _openPath(String path) async {
+    if (_session?.path == path) return true;
+    if (!await _mayDiscard()) return false;
     try {
       _adopt(
         await SpriteStudioSession.open(
@@ -133,8 +163,10 @@ class SpriteStudioState extends State<SpriteStudio> {
           decodeImage: pixelsFromImageBytes,
         ),
       );
+      return true;
     } catch (e) {
-      if (mounted) setState(() => _error = '$e');
+      _showProblem('Could not open ${path.split('/').last}: ${_describe(e)}');
+      return false;
     }
   }
 
@@ -146,23 +178,35 @@ class SpriteStudioState extends State<SpriteStudio> {
   /// the list instead of waiting on a first save. The image it came from
   /// is kept beside it as the original art.
   Future<void> _import() async {
-    final picked = await pickSpriteFile();
-    if (picked == null) return;
+    final picked = await (widget.pickFile ?? pickSpriteFile)();
+    if (picked == null || !mounted) return;
+    final String copied;
     try {
-      final copied = await _sprites.import(
-        picked,
-        into: widget.newSpriteFolder,
-      );
-      await _openPath(copied);
-      if (!copied.toLowerCase().endsWith('.$kProjectExtension') &&
-          _session != null) {
-        await save();
-      }
-      _refreshLibrary();
-      _showToast('Imported ${copied.split('/').last}');
+      copied = await _sprites.import(picked, into: widget.newSpriteFolder);
     } catch (e) {
-      if (mounted) setState(() => _error = '$e');
+      _showProblem('Could not import: ${_describe(e)}');
+      return;
     }
+    // Kept what was open, or the file would not open: nothing came of it,
+    // so the copy goes again.
+    if (!await _openPath(copied)) {
+      try {
+        await File('${_sprites.root}/$copied').delete();
+      } on FileSystemException {
+        // Already gone.
+      }
+      return;
+    }
+    final s = _session;
+    if (s == null || !mounted) return;
+    // Too big to save until it is sliced: what the session said stays up.
+    if (!s.document.fitsForSaving) return;
+    if (!copied.toLowerCase().endsWith('.$kProjectExtension')) {
+      // The copy has a name of its own: nothing to ask about.
+      await save(askBeforeReplacing: false);
+    }
+    _refreshLibrary();
+    _showToast('Imported ${copied.split('/').last}');
   }
 
   Future<void> _open() async {
@@ -195,6 +239,13 @@ class SpriteStudioState extends State<SpriteStudio> {
       _error = null;
     });
     if (next.message.value != null) _showToast(next.message.value);
+    // A sheet bigger than a sprite can be saved: cutting it into frames is
+    // the way on, so that is offered straight away.
+    if (!next.document.fitsForSaving) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _session == next) _sliceIntoFrames();
+      });
+    }
   }
 
   void _showToast(String? text) {
@@ -218,27 +269,84 @@ class SpriteStudioState extends State<SpriteStudio> {
 
   // ── Commands ─────────────────────────────────────────────────────────────
 
-  Future<void> save() async {
+  /// Saves the sprite: asks a new one for a name first — one no file has
+  /// yet — and asks before writing over files this sprite did not write
+  /// ([SpriteStudioSession.filesInTheWay]) unless [askBeforeReplacing] is
+  /// off.
+  Future<void> save({bool askBeforeReplacing = true}) async {
     final s = _session;
     if (s == null) return;
+    if (!s.document.fitsForSaving) return _showToast(s.tooBigToSaveMessage);
     var target = s.path;
     if (target == null) {
       final name = await promptForText(
         context,
         title: 'Name this sprite',
-        initial: 'sprite',
+        initial: freeStem(
+          '${_sprites.root}/${widget.newSpriteFolder}',
+          'sprite',
+          const ['.$kProjectExtension', '.png', '.json'],
+        ),
       );
-      if (name == null || name.isEmpty) return;
-      final safe = name.replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_');
-      target = '${widget.newSpriteFolder}/$safe.jsprite';
+      if (name == null || name.isEmpty || !mounted) return;
+      target = '${widget.newSpriteFolder}/${safeFileName(name)}.jsprite';
+    }
+    if (askBeforeReplacing) {
+      final inTheWay = await s.filesInTheWay(target);
+      if (inTheWay.isNotEmpty && !await _mayReplace(inTheWay)) return;
     }
     try {
       final saved = await s.save(to: target);
       widget.onSaved?.call(saved);
       if (mounted) setState(() {});
     } catch (e) {
-      _showToast('Could not save: $e');
+      _showToast('Could not save: ${_describe(e)}');
     }
+  }
+
+  /// Whether saving may write over [files] (project-relative), which this
+  /// sprite did not write.
+  Future<bool> _mayReplace(List<String> files) async {
+    if (!mounted) return false;
+    final names = [for (final f in files) f.split('/').last];
+    final project = names.where((n) => n.endsWith('.$kProjectExtension'));
+    final list = names.length == 1
+        ? names.single
+        : '${names.sublist(0, names.length - 1).join(', ')} and '
+              '${names.last}';
+    final stem = names.first.substring(0, names.first.lastIndexOf('.'));
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: StudioTheme.panel,
+        title: Text(
+          project.isNotEmpty ? 'Replace ${project.first}?' : 'Save over $list?',
+          style: StudioTheme.body.copyWith(fontSize: 13),
+        ),
+        content: Text(
+          project.isNotEmpty
+              ? 'Another sprite is saved there. Saving writes over $list, '
+                    'and that cannot be undone.'
+              : '$list ${names.length == 1 ? 'is' : 'are'} already there, '
+                    'and this sprite did not write '
+                    '${names.length == 1 ? 'it' : 'them'}. Saving puts this '
+                    "sprite's sheet and atlas there; what was there is kept "
+                    'as $stem.original.png / $stem.original.json.',
+          style: StudioTheme.body,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text(project.isNotEmpty ? 'Replace' : 'Save'),
+          ),
+        ],
+      ),
+    );
+    return ok ?? false;
   }
 
   Future<void> _newSprite() async {
@@ -273,24 +381,22 @@ class SpriteStudioState extends State<SpriteStudio> {
   }
 
   /// Cuts the current picture into frames: for a sheet that was opened as
-  /// one image.
+  /// one image. One undo step; only for a one-frame sprite.
   Future<void> _sliceIntoFrames() async {
     final s = _session!;
+    if (s.document.frames.length > 1) {
+      return s.say('Slicing cuts a one-frame picture: an imported sheet.');
+    }
+    final side = s.document.height.clamp(1, SpriteDocument.maxSize);
     final size = await _promptForSize(
       context,
       'Slice into frames — size of one frame',
-      s.document.height,
-      s.document.height,
+      side,
+      side,
     );
-    if (size == null) return;
-    final sliced = SheetImporter.fromSheet(
-      s.document.flatten(s.frameIndex.value),
-      frameWidth: size.$1,
-      frameHeight: size.$2,
-    )..palette.addAll(s.document.palette);
-    final next = SpriteStudioSession(sliced, path: s.path, root: s.root)
-      ..say('${sliced.frames.length} frames. Tag runs of them as clips.');
-    _adopt(next);
+    if (size == null || !mounted || _session != s) return;
+    final n = s.sliceIntoFrames(size.$1, size.$2);
+    s.say('$n frames. Tag runs of them as clips.');
   }
 
   Future<void> _exportGif() async {
@@ -365,6 +471,10 @@ class SpriteStudioState extends State<SpriteStudio> {
     final keys = HardwareKeyboard.instance;
     final ctrl = EditorKeys.primaryPressed;
     final shift = keys.isShiftPressed;
+    // A key that edits the sprite, or moves off the frame, while a stroke
+    // is being drawn: the stroke ends there, as one step, so that nothing
+    // drawn after the key lands outside the history.
+    void endStroke() => _canvas.currentState?.endGesture();
 
     if (ctrl) {
       if (event is KeyRepeatEvent &&
@@ -373,16 +483,22 @@ class SpriteStudioState extends State<SpriteStudio> {
         return KeyEventResult.handled;
       }
       if (key == LogicalKeyboardKey.keyS) {
+        endStroke();
         save();
       } else if (key == LogicalKeyboardKey.keyZ) {
+        endStroke();
         shift ? s.redo() : s.undo();
       } else if (key == LogicalKeyboardKey.keyY) {
+        endStroke();
         s.redo();
       } else if (key == LogicalKeyboardKey.keyA) {
+        endStroke();
         StudioActions.selectAll(s);
       } else if (key == LogicalKeyboardKey.keyD) {
+        endStroke();
         s.selection.value = null;
       } else if (key == LogicalKeyboardKey.keyN) {
+        endStroke();
         _newSprite();
       } else {
         return KeyEventResult.ignored;
@@ -394,6 +510,7 @@ class SpriteStudioState extends State<SpriteStudio> {
     if (EditorKeys.otherPressed) return KeyEventResult.ignored;
 
     if (keys.isAltPressed && key == LogicalKeyboardKey.keyN) {
+      endStroke();
       s.addFrame();
       return KeyEventResult.handled;
     }
@@ -411,19 +528,24 @@ class SpriteStudioState extends State<SpriteStudio> {
       s.brushSize.value = (s.brushSize.value + 1).clamp(1, 32);
     } else if (key == LogicalKeyboardKey.comma ||
         key == LogicalKeyboardKey.arrowLeft) {
+      endStroke();
       s.stepFrame(-1);
     } else if (key == LogicalKeyboardKey.period ||
         key == LogicalKeyboardKey.arrowRight) {
+      endStroke();
       s.stepFrame(1);
     } else if (key == LogicalKeyboardKey.enter) {
+      if (event is KeyRepeatEvent) return KeyEventResult.handled;
+      endStroke();
       s.togglePlay();
     } else if (key == LogicalKeyboardKey.equal ||
         key == LogicalKeyboardKey.add) {
       s.zoomBy(1);
     } else if (key == LogicalKeyboardKey.minus) {
       s.zoomBy(-1);
-    } else if (key == LogicalKeyboardKey.delete ||
-        key == LogicalKeyboardKey.backspace) {
+    } else if (EditorKeys.isDeleteKey(key)) {
+      // Delete, and the Mac's delete key (Backspace), as across the editor.
+      endStroke();
       StudioActions.deletePixels(s);
     } else if (key == LogicalKeyboardKey.escape) {
       if (!(_canvas.currentState?.cancelGesture() ?? false)) {
@@ -548,7 +670,7 @@ class _TopBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final s = session;
     return SignalBuilder<int>(
-      signal: s.revision,
+      signal: s.structureRevision,
       builder: (context, _, _) => StudioHeader(
         icon: Icons.brush,
         title: 'Sprite Studio',
@@ -605,8 +727,13 @@ class _TopBar extends StatelessWidget {
           ),
           StudioIconButton(
             icon: Icons.view_module_outlined,
-            tooltip: 'Slice this picture into frames (an imported sheet)',
-            onTap: state._sliceIntoFrames,
+            tooltip: s.document.frames.length == 1
+                ? 'Slice this picture into frames (an imported sheet)'
+                : 'Slice into frames: for a one-frame picture, such as an '
+                      'imported sheet',
+            onTap: s.document.frames.length == 1
+                ? state._sliceIntoFrames
+                : null,
           ),
           const SizedBox(width: 8),
           _ExportOptionsButton(session: s),
@@ -705,57 +832,14 @@ Future<(int, int)?> _promptForSize(
   int width,
   int height,
 ) async {
-  final w = TextEditingController(text: '$width');
-  final h = TextEditingController(text: '$height');
-  final ok = await showDialog<bool>(
+  final typed = await showDialog<(String, String)>(
     context: context,
-    builder: (context) => AlertDialog(
-      backgroundColor: StudioTheme.panel,
-      title: Text(title, style: StudioTheme.body.copyWith(fontSize: 13)),
-      content: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          SizedBox(
-            width: 80,
-            child: TextField(
-              controller: w,
-              autofocus: true,
-              style: StudioTheme.body,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Width'),
-            ),
-          ),
-          Padding(
-            padding: EdgeInsets.symmetric(horizontal: 8),
-            child: Text('×', style: StudioTheme.body),
-          ),
-          SizedBox(
-            width: 80,
-            child: TextField(
-              controller: h,
-              style: StudioTheme.body,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Height'),
-              onSubmitted: (_) => Navigator.of(context).pop(true),
-            ),
-          ),
-        ],
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(false),
-          child: const Text('Cancel'),
-        ),
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(true),
-          child: const Text('OK'),
-        ),
-      ],
-    ),
+    builder: (context) =>
+        _SizeDialog(title: title, width: width, height: height),
   );
-  if (ok != true) return null;
-  final width_ = int.tryParse(w.text.trim()) ?? 0;
-  final height_ = int.tryParse(h.text.trim()) ?? 0;
+  if (typed == null) return null;
+  final width_ = int.tryParse(typed.$1.trim()) ?? 0;
+  final height_ = int.tryParse(typed.$2.trim()) ?? 0;
   if (width_ < 1 ||
       height_ < 1 ||
       width_ > SpriteDocument.maxSize ||
@@ -763,4 +847,81 @@ Future<(int, int)?> _promptForSize(
     return null;
   }
   return (width_, height_);
+}
+
+/// The width-and-height dialog. It owns its fields' controllers, so they
+/// go when it does — after its closing animation, not before.
+class _SizeDialog extends StatefulWidget {
+  const _SizeDialog({
+    required this.title,
+    required this.width,
+    required this.height,
+  });
+
+  final String title;
+  final int width;
+  final int height;
+
+  @override
+  State<_SizeDialog> createState() => _SizeDialogState();
+}
+
+class _SizeDialogState extends State<_SizeDialog> {
+  late final TextEditingController _w = TextEditingController(
+    text: '${widget.width}',
+  );
+  late final TextEditingController _h = TextEditingController(
+    text: '${widget.height}',
+  );
+
+  @override
+  void dispose() {
+    _w.dispose();
+    _h.dispose();
+    super.dispose();
+  }
+
+  void _done() => Navigator.of(context).pop((_w.text, _h.text));
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    backgroundColor: StudioTheme.panel,
+    title: Text(widget.title, style: StudioTheme.body.copyWith(fontSize: 13)),
+    content: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          width: 80,
+          child: TextField(
+            controller: _w,
+            autofocus: true,
+            style: StudioTheme.body,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Width'),
+          ),
+        ),
+        Padding(
+          padding: EdgeInsets.symmetric(horizontal: 8),
+          child: Text('×', style: StudioTheme.body),
+        ),
+        SizedBox(
+          width: 80,
+          child: TextField(
+            controller: _h,
+            style: StudioTheme.body,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Height'),
+            onSubmitted: (_) => _done(),
+          ),
+        ),
+      ],
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.of(context).pop(),
+        child: const Text('Cancel'),
+      ),
+      TextButton(onPressed: _done, child: const Text('OK')),
+    ],
+  );
 }

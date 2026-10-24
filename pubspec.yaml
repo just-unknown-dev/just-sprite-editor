@@ -1,6 +1,6 @@
 name: just_sprite_editor
 description: "A pixel-art sprite editor and animator: layers, frames, tags, onion skin, an animation state-machine graph, and an editor module for just_game_engine_editor."
-version: 0.1.0
+version: 0.1.0-beta.1
 homepage: https://github.com/just-unknown-dev/just-sprite-editor
 repository: https://github.com/just-unknown-dev/just-sprite-editor
 issue_tracker: https://github.com/just-unknown-dev/just-sprite-editor/issues
@@ -9,7 +9,8 @@ publish_to: none
 
 environment:
   sdk: ^3.11.0
-  flutter: ">=1.17.0"
+  # just_game_engine (through just_box_2d and just_jolt) needs this.
+  flutter: ">=3.47.1"
 
 dependencies:
   flutter:
@@ -21,14 +22,17 @@ dependencies:
   just_deflate: ^0.1.0
 
   # The system's Open dialog, for bringing a sprite in from outside the
-  # project. Design-time only, like the editor dependency below: a game
-  # never reaches this package at all.
+  # project (lib/src/studio/studio_library.dart).
   file_selector: ^1.1.0
 
-  # Design-time only. `lib/just_sprite_editor.dart` never imports it; only
-  # `lib/editor.dart` does, and a game never imports that.
+  # The editor's module contract and shared kit: keys, fields, package
+  # asset paths. The studio's widgets use it as well as lib/editor.dart.
+  #
+  # Like file_selector, design-time only: every library of this package is
+  # (just_store.json bans them all from a game's code), and the store adds
+  # the package to a game as a dev dependency, so neither reaches a release
+  # build.
   just_editor_core: ^0.1.0-dev.1
-  just_game_engine_formats: ^0.2.0
 
 dev_dependencies:
   flutter_test:

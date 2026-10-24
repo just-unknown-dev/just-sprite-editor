@@ -1,11 +1,15 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:just_signals/just_signals.dart';
 
+import '../document/io/sheet_export.dart';
 import '../document/pixel_buffer.dart';
 import '../document/raster.dart';
 import 'studio_session.dart';
@@ -36,19 +40,39 @@ Future<ui.Image> imageFromPixels(PixelBuffer buffer) {
 }
 
 /// Decodes an image file's bytes into straight-alpha pixels.
+///
+/// Throws [FormatException] for an image too big to open
+/// ([SheetImporter.checkImportSize]) — found from its header, before any
+/// of it is decoded.
 Future<PixelBuffer> pixelsFromImageBytes(List<int> bytes) async {
-  final codec = await ui.instantiateImageCodec(Uint8List.fromList(bytes));
-  final image = (await codec.getNextFrame()).image;
-  final data = await image.toByteData(
-    format: ui.ImageByteFormat.rawStraightRgba,
+  final buffer = await ui.ImmutableBuffer.fromUint8List(
+    Uint8List.fromList(bytes),
   );
-  final out = PixelBuffer.fromRgbaBytes(
-    image.width,
-    image.height,
-    data!.buffer.asUint8List(),
-  );
-  image.dispose();
-  return out;
+  ui.ImageDescriptor? descriptor;
+  ui.Codec? codec;
+  ui.Image? image;
+  try {
+    descriptor = await ui.ImageDescriptor.encoded(buffer);
+    SheetImporter.checkImportSize(descriptor.width, descriptor.height);
+    codec = await descriptor.instantiateCodec();
+    image = (await codec.getNextFrame()).image;
+    final data = await image.toByteData(
+      format: ui.ImageByteFormat.rawStraightRgba,
+    );
+    if (data == null) {
+      throw const FormatException('The image could not be read.');
+    }
+    return PixelBuffer.fromRgbaBytes(
+      image.width,
+      image.height,
+      data.buffer.asUint8List(),
+    );
+  } finally {
+    image?.dispose();
+    codec?.dispose();
+    descriptor?.dispose();
+    buffer.dispose();
+  }
 }
 
 /// The drawing surface: the sprite, zoomed, with the active tool under the
@@ -65,22 +89,52 @@ class StudioCanvas extends StatefulWidget {
 class StudioCanvasState extends State<StudioCanvas> {
   SpriteStudioSession get s => widget.session;
 
+  /// The frame being drawn, on the GPU.
   ui.Image? _image;
-  final Map<int, ui.Image> _onion = {};
-  int _wanted = 0;
+
+  /// Onion-skin frames on the GPU, by frame id: kept while the document's
+  /// structure stays as it was ([SpriteStudioSession.structureRevision]),
+  /// since a stroke only ever changes the frame being drawn.
+  final Map<int, ui.Image> _onionCache = {};
+  int _onionStamp = -1;
+
+  /// What the painter shows of [_onionCache]: by distance from the frame
+  /// being drawn, negative before it.
+  Map<int, ui.Image> _onion = const {};
+
   List<VoidCallback> _stop = const [];
+
+  // One refresh at a time, at most one a frame.
+  bool _scheduled = false;
+  bool _busy = false;
+  bool _again = false;
 
   PixelTool? _tool;
   bool _panning = false;
-  Offset? _hover;
+  final ValueNotifier<({int x, int y})?> _hover = ValueNotifier(null);
   Size _viewSize = Size.zero;
   bool _fitted = false;
+
+  // A trackpad pinch: the scale at which the zoom last stepped.
+  double _pinchAt = 1;
+
+  /// The GPU images this canvas holds now: the frame and its onion skins.
+  @visibleForTesting
+  int get liveImageCount => (_image == null ? 0 : 1) + _onionCache.length;
+
+  /// How many onion-skin frames are on screen.
+  @visibleForTesting
+  int get onionFrameCount => _onion.length;
+
+  /// Whether new GPU images are wanted or being made.
+  @visibleForTesting
+  bool get isRefreshing => _busy || _scheduled || _again;
 
   @override
   void initState() {
     super.initState();
     _watch();
-    _refresh();
+    _scheduleRefresh();
   }
 
   @override
@@ -91,16 +145,19 @@ class StudioCanvasState extends State<StudioCanvas> {
         stop();
       }
       _fitted = false;
+      _dropImages();
       _watch();
-      _refresh();
+      _scheduleRefresh();
     }
   }
 
   void _watch() {
     _stop = [
-      s.revision.watch(_refresh),
-      s.frameIndex.watch(_refresh),
-      s.onionSkin.watch(_refresh),
+      s.revision.watch(_scheduleRefresh),
+      s.frameIndex.watch(_scheduleRefresh),
+      s.onionSkin.watch(_scheduleRefresh),
+      // Onion skins are left out while playing: back when it stops.
+      s.isPlaying.watch(_scheduleRefresh),
     ];
   }
 
@@ -109,35 +166,109 @@ class StudioCanvasState extends State<StudioCanvas> {
     for (final stop in _stop) {
       stop();
     }
+    _dropImages();
+    _hover.dispose();
     super.dispose();
   }
 
-  /// Rebuilds the GPU images of the frame (and its onion neighbours). The
-  /// old image keeps showing until the new one is ready, so nothing flashes.
+  void _dropImages() {
+    _image?.dispose();
+    _image = null;
+    for (final image in _onionCache.values) {
+      image.dispose();
+    }
+    _onionCache.clear();
+    _onion = const {};
+    _onionStamp = -1;
+  }
+
+  /// Asks for the GPU images to be made again — once, before the next
+  /// frame, however many changes arrive meanwhile.
+  void _scheduleRefresh() {
+    if (_busy) {
+      _again = true;
+      return;
+    }
+    if (_scheduled) return;
+    _scheduled = true;
+    SchedulerBinding.instance
+      ..scheduleFrameCallback((_) {
+        _scheduled = false;
+        if (mounted) _refresh();
+      })
+      ..scheduleFrame();
+  }
+
+  /// Makes the GPU images of the frame (and its onion neighbours). The old
+  /// image keeps showing until the new one is ready, so nothing flashes.
   Future<void> _refresh() async {
-    final ticket = ++_wanted;
-    final doc = s.document;
-    final at = s.frameIndex.value.clamp(0, doc.frames.length - 1);
-    final onion = s.onionSkin.value;
-    final neighbours = <int>[
-      if (onion.enabled && !s.isPlaying.value) ...[
-        for (var i = 1; i <= onion.before; i++)
-          if (at - i >= 0) at - i,
-        for (var i = 1; i <= onion.after; i++)
-          if (at + i < doc.frames.length) at + i,
-      ],
-    ];
-    final image = await imageFromPixels(doc.flatten(at));
-    final skins = <int, ui.Image>{
-      for (final i in neighbours) i - at: await imageFromPixels(doc.flatten(i)),
-    };
-    if (!mounted || ticket != _wanted) return;
-    setState(() {
-      _image = image;
-      _onion
-        ..clear()
-        ..addAll(skins);
-    });
+    _busy = true;
+    _again = false;
+    final session = s;
+    final made = <ui.Image>[];
+    try {
+      final doc = session.document;
+      final at = session.frameIndex.value.clamp(0, doc.frames.length - 1);
+      final onion = session.onionSkin.value;
+      final stamp = session.structureRevision.value;
+      final offsets = <int>[
+        if (onion.enabled && !session.isPlaying.value) ...[
+          for (var i = 1; i <= onion.before; i++)
+            if (at - i >= 0) -i,
+          for (var i = 1; i <= onion.after; i++)
+            if (at + i < doc.frames.length) i,
+        ],
+      ];
+      final reusable = stamp == _onionStamp
+          ? _onionCache
+          : const <int, ui.Image>{};
+      final image = await imageFromPixels(doc.flatten(at));
+      made.add(image);
+      final skins = <int, ui.Image>{};
+      for (final offset in offsets) {
+        final id = doc.frames[at + offset].id;
+        final cached = reusable[id];
+        if (cached != null) {
+          skins[id] = cached;
+        } else {
+          final fresh = await imageFromPixels(doc.flatten(at + offset));
+          made.add(fresh);
+          skins[id] = fresh;
+        }
+      }
+      if (!mounted || session != s) {
+        for (final i in made) {
+          i.dispose();
+        }
+        if (mounted) _again = true;
+        return;
+      }
+      final oldImage = _image;
+      final evicted = [
+        for (final e in _onionCache.entries)
+          if (!identical(skins[e.key], e.value)) e.value,
+      ];
+      setState(() {
+        _image = image;
+        _onionCache
+          ..clear()
+          ..addAll(skins);
+        _onionStamp = stamp;
+        _onion = {
+          for (final offset in offsets)
+            offset: skins[doc.frames[at + offset].id]!,
+        };
+      });
+      // A picture already painted keeps what it drew; these handles are
+      // all that is let go.
+      oldImage?.dispose();
+      for (final i in evicted) {
+        i.dispose();
+      }
+    } finally {
+      _busy = false;
+      if (_again && mounted) _scheduleRefresh();
+    }
   }
 
   // ── Geometry ─────────────────────────────────────────────────────────────
@@ -166,6 +297,7 @@ class StudioCanvasState extends State<StudioCanvas> {
           LogicalKeyboardKey.space,
         )) {
       _panning = true;
+      _hover.value = null;
       return;
     }
     s.stop();
@@ -192,7 +324,9 @@ class StudioCanvasState extends State<StudioCanvas> {
     }
     final p = pixelAt(e.localPosition);
     _tool?.drag(s, p.x, p.y);
-    setState(() => _hover = e.localPosition);
+    // Only the brush outline follows the pointer: the sprite is not
+    // painted again for it.
+    _hover.value = p;
   }
 
   void _up(PointerEvent e) {
@@ -200,6 +334,9 @@ class StudioCanvasState extends State<StudioCanvas> {
     _tool?.up(s);
     _tool = null;
   }
+
+  /// Whether a gesture is in progress on the canvas.
+  bool get isDrawing => _tool != null;
 
   /// Abandons the gesture in progress. True if there was one.
   bool cancelGesture() {
@@ -210,13 +347,44 @@ class StudioCanvasState extends State<StudioCanvas> {
     return true;
   }
 
+  /// Finishes the gesture in progress as if the pointer had come up — what
+  /// drawn so far is one step — and draws no more until the next one. For
+  /// a key that edits the sprite mid-stroke: undo then takes back the
+  /// stroke, and nothing drawn after lands outside the history. True if
+  /// there was one.
+  bool endGesture() {
+    final tool = _tool;
+    if (tool == null) return false;
+    tool.up(s);
+    _tool = null;
+    return true;
+  }
+
+  /// Zooms by [steps] about [local]: the pixel under it stays under it.
+  void _zoomAbout(Offset local, int steps) {
+    final before = (local - _origin) / s.zoom.value;
+    s.zoomBy(steps);
+    final after = _origin + before * s.zoom.value;
+    s.pan.value += local - after;
+  }
+
   void _scroll(PointerSignalEvent e) {
     if (e is! PointerScrollEvent) return;
-    // Zoom about the pointer: the pixel under it stays under it.
-    final before = (e.localPosition - _origin) / s.zoom.value;
-    s.zoomBy(e.scrollDelta.dy < 0 ? 1 : -1);
-    final after = _origin + before * s.zoom.value;
-    s.pan.value += e.localPosition - after;
+    _zoomAbout(e.localPosition, e.scrollDelta.dy < 0 ? 1 : -1);
+  }
+
+  // A trackpad (a Mac's above all): two fingers pan, a pinch zooms.
+  void _panZoomStart(PointerPanZoomStartEvent e) => _pinchAt = 1;
+
+  void _panZoomUpdate(PointerPanZoomUpdateEvent e) {
+    if (e.localPanDelta != Offset.zero) s.pan.value += e.localPanDelta;
+    if (e.scale >= _pinchAt * 1.25) {
+      _pinchAt = e.scale;
+      _zoomAbout(e.localPosition, 1);
+    } else if (e.scale <= _pinchAt * 0.8) {
+      _pinchAt = e.scale;
+      _zoomAbout(e.localPosition, -1);
+    }
   }
 
   @override
@@ -241,95 +409,141 @@ class StudioCanvasState extends State<StudioCanvas> {
             s.tool,
             s.brushSize,
           ],
-          builder: (context, _) => MouseRegion(
-            cursor: SystemMouseCursors.precise,
-            onExit: (_) => setState(() => _hover = null),
-            child: Listener(
-              behavior: HitTestBehavior.opaque,
-              onPointerDown: _down,
-              onPointerMove: _move,
-              onPointerHover: _move,
-              onPointerUp: _up,
-              onPointerCancel: (e) {
-                _panning = false;
-                cancelGesture();
-              },
-              onPointerSignal: _scroll,
-              child: ClipRect(
-                child: CustomPaint(
-                  size: Size.infinite,
-                  painter: _CanvasPainter(
-                    image: _image,
-                    onion: Map.of(_onion),
-                    origin: _origin,
-                    zoom: s.zoom.value,
-                    width: s.document.width,
-                    height: s.document.height,
-                    selection: s.selection.value,
-                    symmetry: s.symmetry.value,
-                    showGrid: s.showGrid.value,
-                    hover: _hover == null || _panning ? null : pixelAt(_hover!),
-                    brush: switch (s.tool.value) {
-                      StudioTool.pencil ||
-                      StudioTool.eraser ||
-                      StudioTool.line ||
-                      StudioTool.rectangle ||
-                      StudioTool.ellipse => s.brushSize.value,
-                      _ => 1,
-                    },
+          builder: (context, _) {
+            final origin = _origin;
+            final zoom = s.zoom.value;
+            final w = s.document.width, h = s.document.height;
+            return MouseRegion(
+              cursor: SystemMouseCursors.precise,
+              onExit: (_) => _hover.value = null,
+              child: Listener(
+                behavior: HitTestBehavior.opaque,
+                onPointerDown: _down,
+                onPointerMove: _move,
+                onPointerHover: _move,
+                onPointerUp: _up,
+                onPointerCancel: (e) {
+                  _panning = false;
+                  cancelGesture();
+                },
+                onPointerSignal: _scroll,
+                onPointerPanZoomStart: _panZoomStart,
+                onPointerPanZoomUpdate: _panZoomUpdate,
+                child: ClipRect(
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      // Each layer repaints for its own reasons only: the
+                      // checkerboard when the view moves, the sprite when
+                      // its picture is new, the brush outline as the
+                      // pointer moves.
+                      RepaintBoundary(
+                        child: CustomPaint(
+                          painter: BackdropPainter(
+                            origin: origin,
+                            zoom: zoom,
+                            width: w,
+                            height: h,
+                          ),
+                        ),
+                      ),
+                      RepaintBoundary(
+                        child: CustomPaint(
+                          painter: _SpritePainter(
+                            image: _image,
+                            onion: _onion,
+                            origin: origin,
+                            zoom: zoom,
+                            width: w,
+                            height: h,
+                          ),
+                        ),
+                      ),
+                      RepaintBoundary(
+                        child: CustomPaint(
+                          painter: _OverlayPainter(
+                            origin: origin,
+                            zoom: zoom,
+                            width: w,
+                            height: h,
+                            selection: s.selection.value,
+                            symmetry: s.symmetry.value,
+                            showGrid: s.showGrid.value,
+                          ),
+                        ),
+                      ),
+                      CustomPaint(
+                        painter: _HoverPainter(
+                          hover: _hover,
+                          origin: origin,
+                          zoom: zoom,
+                          brush: switch (s.tool.value) {
+                            StudioTool.pencil ||
+                            StudioTool.eraser ||
+                            StudioTool.line ||
+                            StudioTool.rectangle ||
+                            StudioTool.ellipse => s.brushSize.value,
+                            _ => 1,
+                          },
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-            ),
-          ),
+            );
+          },
         );
       },
     );
   }
 }
 
-class _CanvasPainter extends CustomPainter {
-  _CanvasPainter({
-    required this.image,
-    required this.onion,
+/// The part of [sprite] that shows in a view of [size].
+Rect _visible(Rect sprite, Size size) => sprite.intersect(Offset.zero & size);
+
+/// The work area, and the checkerboard under the sprite — only the squares
+/// in view, however large the sprite and however far it is zoomed.
+@visibleForTesting
+class BackdropPainter extends CustomPainter {
+  BackdropPainter({
     required this.origin,
     required this.zoom,
     required this.width,
     required this.height,
-    required this.selection,
-    required this.symmetry,
-    required this.showGrid,
-    required this.hover,
-    required this.brush,
   });
 
-  final ui.Image? image;
-  final Map<int, ui.Image> onion;
   final Offset origin;
   final double zoom;
   final int width;
   final int height;
-  final SelectionMask? selection;
-  final Symmetry symmetry;
-  final bool showGrid;
-  final ({int x, int y})? hover;
-  final int brush;
+
+  /// How many dark squares the last paint drew.
+  @visibleForTesting
+  int squaresPainted = 0;
 
   @override
   void paint(Canvas canvas, Size size) {
     canvas.drawRect(Offset.zero & size, Paint()..color = StudioTheme.workArea);
     final sprite = origin & Size(width * zoom, height * zoom);
+    final shown = _visible(sprite, size);
+    if (shown.isEmpty) return;
 
-    // Transparency: the checkerboard, two sprite pixels to a square at
-    // least, so it never competes with the art.
-    canvas
-      ..save()
-      ..clipRect(sprite);
+    // Two sprite pixels to a square at least when zoomed out, so it never
+    // competes with the art.
     final cell = zoom * (zoom >= 8 ? 1 : (8 / zoom).ceil());
     final dark = Paint()..color = StudioTheme.checkerDark;
-    canvas.drawRect(sprite, Paint()..color = StudioTheme.checkerLight);
-    for (var y = 0; y * cell < sprite.height; y++) {
-      for (var x = y.isEven ? 1 : 0; x * cell < sprite.width; x += 2) {
+    canvas.drawRect(shown, Paint()..color = StudioTheme.checkerLight);
+    final x0 = ((shown.left - sprite.left) / cell).floor();
+    final x1 = ((shown.right - sprite.left) / cell).ceil();
+    final y0 = ((shown.top - sprite.top) / cell).floor();
+    final y1 = ((shown.bottom - sprite.top) / cell).ceil();
+    canvas
+      ..save()
+      ..clipRect(shown);
+    var squares = 0;
+    for (var y = y0; y < y1; y++) {
+      for (var x = x0 + ((x0 + y).isEven ? 1 : 0); x < x1; x += 2) {
         canvas.drawRect(
           Rect.fromLTWH(
             sprite.left + x * cell,
@@ -339,10 +553,42 @@ class _CanvasPainter extends CustomPainter {
           ),
           dark,
         );
+        squares++;
       }
     }
     canvas.restore();
+    squaresPainted = squares;
+  }
 
+  @override
+  bool shouldRepaint(BackdropPainter old) =>
+      old.origin != origin ||
+      old.zoom != zoom ||
+      old.width != width ||
+      old.height != height;
+}
+
+/// The sprite and its onion skins.
+class _SpritePainter extends CustomPainter {
+  _SpritePainter({
+    required this.image,
+    required this.onion,
+    required this.origin,
+    required this.zoom,
+    required this.width,
+    required this.height,
+  });
+
+  final ui.Image? image;
+  final Map<int, ui.Image> onion;
+  final Offset origin;
+  final double zoom;
+  final int width;
+  final int height;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final sprite = origin & Size(width * zoom, height * zoom);
     final src = Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble());
     for (final entry in onion.entries) {
       // Frames before are warm, frames after are cool, fainter with distance.
@@ -370,26 +616,65 @@ class _CanvasPainter extends CustomPainter {
         Paint()..filterQuality = FilterQuality.none,
       );
     }
+  }
 
-    if (showGrid && zoom >= 8) {
+  @override
+  bool shouldRepaint(_SpritePainter old) =>
+      !identical(old.image, image) ||
+      !identical(old.onion, onion) ||
+      old.origin != origin ||
+      old.zoom != zoom ||
+      old.width != width ||
+      old.height != height;
+}
+
+/// The pixel grid, the border, the symmetry axes and the selection's edge.
+class _OverlayPainter extends CustomPainter {
+  _OverlayPainter({
+    required this.origin,
+    required this.zoom,
+    required this.width,
+    required this.height,
+    required this.selection,
+    required this.symmetry,
+    required this.showGrid,
+  });
+
+  final Offset origin;
+  final double zoom;
+  final int width;
+  final int height;
+  final SelectionMask? selection;
+  final Symmetry symmetry;
+  final bool showGrid;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final sprite = origin & Size(width * zoom, height * zoom);
+    final shown = _visible(sprite, size);
+
+    if (showGrid && zoom >= 8 && !shown.isEmpty) {
       final line = Paint()
         ..color = StudioTheme.pixelGrid
         ..strokeWidth = 1;
-      for (var x = 1; x < width; x++) {
+      // Only the lines in view.
+      final x0 = math.max(1, ((shown.left - sprite.left) / zoom).floor());
+      final x1 = math.min(
+        width - 1,
+        ((shown.right - sprite.left) / zoom).ceil(),
+      );
+      for (var x = x0; x <= x1; x++) {
         final dx = sprite.left + x * zoom;
-        canvas.drawLine(
-          Offset(dx, sprite.top),
-          Offset(dx, sprite.bottom),
-          line,
-        );
+        canvas.drawLine(Offset(dx, shown.top), Offset(dx, shown.bottom), line);
       }
-      for (var y = 1; y < height; y++) {
+      final y0 = math.max(1, ((shown.top - sprite.top) / zoom).floor());
+      final y1 = math.min(
+        height - 1,
+        ((shown.bottom - sprite.top) / zoom).ceil(),
+      );
+      for (var y = y0; y <= y1; y++) {
         final dy = sprite.top + y * zoom;
-        canvas.drawLine(
-          Offset(sprite.left, dy),
-          Offset(sprite.right, dy),
-          line,
-        );
+        canvas.drawLine(Offset(shown.left, dy), Offset(shown.right, dy), line);
       }
     }
     canvas.drawRect(
@@ -421,53 +706,16 @@ class _CanvasPainter extends CustomPainter {
 
     final mask = selection;
     if (mask != null) _paintSelection(canvas, mask);
-
-    final at = hover;
-    if (at != null) {
-      for (final b in Raster.brush(brush)) {
-        canvas.drawRect(
-          Rect.fromLTWH(
-            origin.dx + (at.x + b.x) * zoom,
-            origin.dy + (at.y + b.y) * zoom,
-            zoom,
-            zoom,
-          ),
-          Paint()..color = StudioTheme.hover,
-        );
-      }
-    }
   }
 
-  /// The selection's edge: a segment wherever a selected pixel meets one
-  /// that is not, light over dark so it shows on any art.
+  /// The selection's edge — the mask's own outline, worked out once per
+  /// mask — light over dark so it shows on any art.
   void _paintSelection(Canvas canvas, SelectionMask mask) {
     final path = Path();
-    final b = mask.bounds;
-    for (var y = b.top; y < b.bottom; y++) {
-      for (var x = b.left; x < b.right; x++) {
-        if (!mask.contains(x, y)) continue;
-        final l = origin.dx + x * zoom, t = origin.dy + y * zoom;
-        if (!mask.contains(x, y - 1)) {
-          path
-            ..moveTo(l, t)
-            ..lineTo(l + zoom, t);
-        }
-        if (!mask.contains(x, y + 1)) {
-          path
-            ..moveTo(l, t + zoom)
-            ..lineTo(l + zoom, t + zoom);
-        }
-        if (!mask.contains(x - 1, y)) {
-          path
-            ..moveTo(l, t)
-            ..lineTo(l, t + zoom);
-        }
-        if (!mask.contains(x + 1, y)) {
-          path
-            ..moveTo(l + zoom, t)
-            ..lineTo(l + zoom, t + zoom);
-        }
-      }
+    for (final (x0, y0, x1, y1) in mask.outline) {
+      path
+        ..moveTo(origin.dx + x0 * zoom, origin.dy + y0 * zoom)
+        ..lineTo(origin.dx + x1 * zoom, origin.dy + y1 * zoom);
     }
     canvas
       ..drawPath(
@@ -487,5 +735,53 @@ class _CanvasPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_CanvasPainter old) => true;
+  bool shouldRepaint(_OverlayPainter old) =>
+      old.origin != origin ||
+      old.zoom != zoom ||
+      old.width != width ||
+      old.height != height ||
+      !identical(old.selection, selection) ||
+      old.symmetry != symmetry ||
+      old.showGrid != showGrid;
+}
+
+/// The brush's outline under the pointer: repainted as [hover] changes,
+/// alone.
+class _HoverPainter extends CustomPainter {
+  _HoverPainter({
+    required this.hover,
+    required this.origin,
+    required this.zoom,
+    required this.brush,
+  }) : super(repaint: hover);
+
+  final ValueListenable<({int x, int y})?> hover;
+  final Offset origin;
+  final double zoom;
+  final int brush;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final at = hover.value;
+    if (at == null) return;
+    final paint = Paint()..color = StudioTheme.hover;
+    for (final b in Raster.brush(brush)) {
+      canvas.drawRect(
+        Rect.fromLTWH(
+          origin.dx + (at.x + b.x) * zoom,
+          origin.dy + (at.y + b.y) * zoom,
+          zoom,
+          zoom,
+        ),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_HoverPainter old) =>
+      old.hover != hover ||
+      old.origin != origin ||
+      old.zoom != zoom ||
+      old.brush != brush;
 }

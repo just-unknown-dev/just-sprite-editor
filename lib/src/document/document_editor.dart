@@ -59,16 +59,28 @@ class CelPatchCommand extends DocumentCommand {
 /// A change to the document's shape — layers, frames, tags, palette, canvas
 /// size — kept as the structure before and after.
 class StructureCommand extends DocumentCommand {
-  StructureCommand(this.label, this.before, this.after);
+  StructureCommand(this.label, this.before, this.after)
+    : weight = 1024 + _ownedBytes(before, after);
 
   @override
   final String label;
   final DocumentStructure before;
   final DocumentStructure after;
 
-  // Structures share cel buffers; what they hold of their own is small.
+  /// Structures share cel buffers with the document; what counts is the
+  /// buffers only [before] holds — the cels of a deleted layer, the
+  /// canvas before a resize — which nothing else keeps alive.
   @override
-  int get weight => 1024;
+  final int weight;
+
+  static int _ownedBytes(DocumentStructure before, DocumentStructure after) {
+    final kept = Set<PixelBuffer>.identity()..addAll(after.cels.values);
+    var bytes = 0;
+    for (final c in before.cels.values) {
+      if (!kept.contains(c)) bytes += c.pixels.length * 4;
+    }
+    return bytes;
+  }
 
   @override
   void redo(SpriteDocument doc) => doc.restore(after);
@@ -101,8 +113,32 @@ class CelStroke {
   /// shape from scratch as the pointer moves.
   PixelBuffer get original => _before;
 
-  /// Puts the cel back as it was when the stroke began, to draw again.
-  void reset() => buffer.pixels.setAll(0, _before.pixels);
+  /// Whether the stroke has been committed or cancelled. A tool holding a
+  /// done stroke must stop drawing into [buffer]: what it drew there would
+  /// be in no undo step.
+  bool get isDone => _done;
+
+  /// Puts the cel back as it was when the stroke began, to draw again —
+  /// only inside [area] when given, which is all a tool that knows where it
+  /// drew last needs. Does nothing once the stroke is [isDone].
+  void reset([IntRect? area]) {
+    if (_done) return;
+    if (area == null) {
+      buffer.pixels.setAll(0, _before.pixels);
+      return;
+    }
+    final r = area.intersect(buffer.bounds);
+    final w = buffer.width;
+    for (var y = r.top; y < r.bottom; y++) {
+      final row = y * w;
+      buffer.pixels.setRange(
+        row + r.left,
+        row + r.right,
+        _before.pixels,
+        row + r.left,
+      );
+    }
+  }
 
   /// Ends the stroke as one undo step. False when nothing changed.
   bool commit() {
@@ -135,7 +171,7 @@ class CelStroke {
     _done = true;
     _editor._stroke = null;
     if (_existed) {
-      reset();
+      buffer.pixels.setAll(0, _before.pixels);
       _editor.document.touch();
     } else {
       _editor.document.setCel(layerId, frameId, null);
@@ -187,10 +223,19 @@ class DocumentEditor {
   String? get undoLabel => _undo.isEmpty ? null : _undo.last.label;
   String? get redoLabel => _redo.isEmpty ? null : _redo.last.label;
 
+  /// Bumped by every step recorded, undone or redone, and by [markSaved]:
+  /// whatever the history or the saved point shows has changed when this
+  /// has. Pixels drawn into a stroke still open do not bump it.
+  int get version => _version;
+  int _version = 0;
+
   /// Whether there is anything since the last [markSaved].
   bool get isDirty => _savedAt != _undo.length;
 
-  void markSaved() => _savedAt = _undo.length;
+  void markSaved() {
+    _savedAt = _undo.length;
+    _version++;
+  }
 
   /// Starts drawing into a cel. A stroke still open is committed first.
   /// Null for a locked or missing layer.
@@ -215,6 +260,7 @@ class DocumentEditor {
   }
 
   void _record(DocumentCommand command) {
+    _version++;
     _undo.add(command);
     _bytes += command.weight;
     if (_redo.isNotEmpty) {
@@ -234,6 +280,7 @@ class DocumentEditor {
     final command = _undo.removeLast()..undo(document);
     _bytes -= command.weight;
     _redo.add(command);
+    _version++;
     return true;
   }
 
@@ -243,6 +290,7 @@ class DocumentEditor {
     final command = _redo.removeLast()..redo(document);
     _bytes += command.weight;
     _undo.add(command);
+    _version++;
     return true;
   }
 }

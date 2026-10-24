@@ -44,19 +44,22 @@ abstract final class Raster {
     var i = 1;
     while (i < path.length - 1) {
       final a = out.last, b = path[i], c = path[i + 1];
-      final isCorner =
-          (a.x == b.x || a.y == b.y) &&
-          (c.x == b.x || c.y == b.y) &&
-          a.x != c.x &&
-          a.y != c.y &&
-          (a.x - c.x).abs() == 1 &&
-          (a.y - c.y).abs() == 1;
-      if (!isCorner) out.add(b);
+      if (!isCorner(a, b, c)) out.add(b);
       i++;
     }
     out.add(path.last);
     return out;
   }
+
+  /// The corner of an L, as [pixelPerfect] sees it: [b] touches [a] and
+  /// [c] by an edge each, while they touch each other by a corner.
+  static bool isCorner(Pixel a, Pixel b, Pixel c) =>
+      (a.x == b.x || a.y == b.y) &&
+      (c.x == b.x || c.y == b.y) &&
+      a.x != c.x &&
+      a.y != c.y &&
+      (a.x - c.x).abs() == 1 &&
+      (a.y - c.y).abs() == 1;
 
   /// The pixels a round brush of [size] covers when centred on (0,0). Sizes
   /// 1–2 are squares; above that, a disc. Even sizes sit up-left of centre,
@@ -261,6 +264,33 @@ abstract final class Raster {
   }
 }
 
+/// [Raster.pixelPerfect] worked out a point at a time, as a stroke is
+/// drawn: the same pixels, but each new point costs only itself — and at
+/// most one earlier point, the corner it turned into, taken back.
+class PixelPerfectPath {
+  /// The cleaned path so far. Its last point always stays until the next
+  /// one arrives, as the whole-path version keeps a path's last point.
+  final List<Pixel> points = [];
+
+  /// Adds [p] to the path. Returns the point it made a corner of, now gone
+  /// from [points], or null.
+  Pixel? add(Pixel p) {
+    if (points.length < 2) {
+      points.add(p);
+      return null;
+    }
+    final b = points.removeLast();
+    if (Raster.isCorner(points.last, b, p)) {
+      points.add(p);
+      return b;
+    }
+    points
+      ..add(b)
+      ..add(p);
+    return null;
+  }
+}
+
 /// Which pixels of the canvas are selected.
 class SelectionMask {
   SelectionMask(this.width, this.height) : _bits = Uint8List(width * height);
@@ -285,16 +315,24 @@ class SelectionMask {
   void set(int x, int y, bool selected) {
     if (x >= 0 && y >= 0 && x < width && y < height) {
       _bits[y * width + x] = selected ? 1 : 0;
+      _bounds = null;
+      _outline = null;
     }
   }
 
-  bool get isEmpty => !_bits.any((b) => b != 0);
+  bool get isEmpty => bounds.isEmpty;
 
-  IntRect get bounds {
+  /// The smallest rectangle holding every selected pixel; worked out once
+  /// until the mask changes.
+  IntRect get bounds => _bounds ??= _findBounds();
+  IntRect? _bounds;
+
+  IntRect _findBounds() {
     var minX = width, minY = height, maxX = -1, maxY = -1;
     for (var y = 0; y < height; y++) {
+      final row = y * width;
       for (var x = 0; x < width; x++) {
-        if (_bits[y * width + x] == 0) continue;
+        if (_bits[row + x] == 0) continue;
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
@@ -302,6 +340,43 @@ class SelectionMask {
       }
     }
     return maxX < 0 ? IntRect.empty : IntRect(minX, minY, maxX + 1, maxY + 1);
+  }
+
+  /// The selection's edge, in canvas pixels: every unit segment where a
+  /// selected pixel meets one that is not, with the segments of one row or
+  /// column joined into runs. `(x0, y0, x1, y1)` each. Worked out once
+  /// until the mask changes — a view draws it scaled, every frame.
+  List<(int, int, int, int)> get outline => _outline ??= _findOutline();
+  List<(int, int, int, int)>? _outline;
+
+  List<(int, int, int, int)> _findOutline() {
+    final b = bounds;
+    final out = <(int, int, int, int)>[];
+    // Horizontal edges: along each line y between rows y-1 and y.
+    for (var y = b.top; y <= b.bottom; y++) {
+      var start = -1;
+      for (var x = b.left; x <= b.right; x++) {
+        final edge = x < b.right && contains(x, y) != contains(x, y - 1);
+        if (edge && start < 0) start = x;
+        if (!edge && start >= 0) {
+          out.add((start, y, x, y));
+          start = -1;
+        }
+      }
+    }
+    // Vertical edges: along each line x between columns x-1 and x.
+    for (var x = b.left; x <= b.right; x++) {
+      var start = -1;
+      for (var y = b.top; y <= b.bottom; y++) {
+        final edge = y < b.bottom && contains(x, y) != contains(x - 1, y);
+        if (edge && start < 0) start = y;
+        if (!edge && start >= 0) {
+          out.add((x, start, x, y));
+          start = -1;
+        }
+      }
+    }
+    return out;
   }
 
   /// The selected pixels of [source] as a buffer the size of [bounds], the
@@ -319,19 +394,25 @@ class SelectionMask {
 
   /// Makes the selected pixels of [target] transparent.
   void clearIn(PixelBuffer target) {
-    for (var y = 0; y < height; y++) {
-      for (var x = 0; x < width; x++) {
-        if (_bits[y * width + x] != 0) target.set(x, y, Argb.transparent);
+    final b = bounds.intersect(target.bounds);
+    for (var y = b.top; y < b.bottom; y++) {
+      for (var x = b.left; x < b.right; x++) {
+        if (_bits[y * width + x] != 0) {
+          target.pixels[y * target.width + x] = Argb.transparent;
+        }
       }
     }
   }
 
+  /// This selection moved by ([dx], [dy]); what moves off the canvas goes.
   SelectionMask translated(int dx, int dy) {
     final out = SelectionMask(width, height);
-    for (var y = 0; y < height; y++) {
-      for (var x = 0; x < width; x++) {
-        if (_bits[y * width + x] != 0) out.set(x + dx, y + dy, true);
-      }
+    final b = bounds;
+    final to = b.translate(dx, dy).intersect(IntRect(0, 0, width, height));
+    for (var y = to.top; y < to.bottom; y++) {
+      final from = (y - dy) * width + (to.left - dx);
+      final row = y * width;
+      out._bits.setRange(row + to.left, row + to.right, _bits, from);
     }
     return out;
   }

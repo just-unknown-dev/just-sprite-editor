@@ -541,7 +541,7 @@ class ColorPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final s = session;
     return SignalConsumer(
-      signals: [s.primary, s.secondary, s.revision],
+      signals: [s.primary, s.secondary, s.structureRevision],
       builder: (context, _) {
         final hsv = HSVColor.fromColor(Color(s.primary.value));
         void set(HSVColor next) => s.primary.value = next.toColor().toARGB32();
@@ -896,7 +896,7 @@ class LayersPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final s = session;
     return SignalConsumer(
-      signals: [s.revision, s.layerIndex],
+      signals: [s.structureRevision, s.layerIndex],
       builder: (context, _) {
         final layers = s.document.layers;
         return Column(
@@ -968,7 +968,9 @@ class LayersPanel extends StatelessWidget {
                         onChanged: (v) {
                           s.layer.opacity = (v * 255).round();
                           s.document.touch();
-                          s.changed();
+                          // No step yet, but the slider and its number
+                          // follow.
+                          s.changed(structure: true);
                         },
                         onChangeStart: (_) => _opacityBefore = s.layer.opacity,
                         onChangeEnd: (v) {
@@ -1076,30 +1078,56 @@ Future<String?> promptForText(
   BuildContext context, {
   required String title,
   String initial = '',
-}) {
-  final controller = TextEditingController(text: initial)
-    ..selection = TextSelection(baseOffset: 0, extentOffset: initial.length);
-  return showDialog<String>(
-    context: context,
-    builder: (context) => AlertDialog(
-      backgroundColor: StudioTheme.panel,
-      title: Text(title, style: StudioTheme.body.copyWith(fontSize: 13)),
-      content: TextField(
-        controller: controller,
-        autofocus: true,
-        style: StudioTheme.body,
-        onSubmitted: (v) => Navigator.of(context).pop(v.trim()),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancel'),
-        ),
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(controller.text.trim()),
-          child: const Text('OK'),
-        ),
-      ],
+}) => showDialog<String>(
+  context: context,
+  builder: (context) => _TextDialog(title: title, initial: initial),
+);
+
+/// The one-field dialog. It owns its controller, so the controller goes
+/// when the dialog does — after its closing animation, not before.
+class _TextDialog extends StatefulWidget {
+  const _TextDialog({required this.title, required this.initial});
+
+  final String title;
+  final String initial;
+
+  @override
+  State<_TextDialog> createState() => _TextDialogState();
+}
+
+class _TextDialogState extends State<_TextDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initial)
+        ..selection = TextSelection(
+          baseOffset: 0,
+          extentOffset: widget.initial.length,
+        );
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    backgroundColor: StudioTheme.panel,
+    title: Text(widget.title, style: StudioTheme.body.copyWith(fontSize: 13)),
+    content: TextField(
+      controller: _controller,
+      autofocus: true,
+      style: StudioTheme.body,
+      onSubmitted: (v) => Navigator.of(context).pop(v.trim()),
     ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.of(context).pop(),
+        child: const Text('Cancel'),
+      ),
+      TextButton(
+        onPressed: () => Navigator.of(context).pop(_controller.text.trim()),
+        child: const Text('OK'),
+      ),
+    ],
   );
 }

@@ -17,7 +17,22 @@ abstract final class JspriteCodec {
   static String encode(SpriteDocument doc) =>
       const JsonEncoder.withIndent(' ').convert(toJson(doc));
 
-  static Map<String, dynamic> toJson(SpriteDocument doc) => {
+  /// Throws [ArgumentError] for a sprite bigger than [decode] reads back
+  /// ([SpriteDocument.fitsForSaving]): a file that could never be opened
+  /// again is not written.
+  static Map<String, dynamic> toJson(SpriteDocument doc) {
+    if (!doc.fitsForSaving) {
+      throw ArgumentError(
+        'A sprite can be saved at most ${SpriteDocument.maxSize} × '
+        '${SpriteDocument.maxSize}; this one is ${doc.width} × '
+        '${doc.height}. Slice it into frames, crop it or make the canvas '
+        'smaller first.',
+      );
+    }
+    return _toJson(doc);
+  }
+
+  static Map<String, dynamic> _toJson(SpriteDocument doc) => {
     'format': 'jsprite',
     'version': formatVersion,
     'width': doc.width,
@@ -108,7 +123,34 @@ abstract final class JspriteCodec {
     return fromJson(json);
   }
 
+  /// Reads [toJson]'s shape. Throws [FormatException] for one from a newer
+  /// studio, or one that is damaged: a value of the wrong type, an id used
+  /// twice or out of range, a cel outside the canvas.
   static SpriteDocument fromJson(Map<String, dynamic> json) {
+    try {
+      return _fromJson(json);
+    } on TypeError catch (e) {
+      throw FormatException(
+        'This sprite project is damaged: a value has the wrong type ($e).',
+      );
+    }
+  }
+
+  static FormatException _damaged(String what) =>
+      FormatException('This sprite project is damaged: $what.');
+
+  /// A layer or frame id: from 1 up to [SpriteDocument.idLimit], and not
+  /// one already in [seen].
+  static int _id(Object? raw, Set<int> seen, String what) {
+    final id = (raw as num).toInt();
+    if (id < 1 || id >= SpriteDocument.idLimit) {
+      throw _damaged('$what id $id is out of range');
+    }
+    if (!seen.add(id)) throw _damaged('$what id $id is used twice');
+    return id;
+  }
+
+  static SpriteDocument _fromJson(Map<String, dynamic> json) {
     final version = (json['version'] as num?)?.toInt() ?? 0;
     if (version > formatVersion) {
       throw FormatException(
@@ -125,10 +167,11 @@ abstract final class JspriteCodec {
     }
     final doc = SpriteDocument(width: width, height: height);
     var highest = 0;
+    final layerIds = <int>{}, frameIds = <int>{};
 
     for (final raw in (json['layers'] as List?) ?? const []) {
       final l = (raw as Map).cast<String, dynamic>();
-      final id = (l['id'] as num).toInt();
+      final id = _id(l['id'], layerIds, 'layer');
       if (id > highest) highest = id;
       doc.layers.add(
         SpriteLayer(
@@ -142,7 +185,7 @@ abstract final class JspriteCodec {
     }
     for (final raw in (json['frames'] as List?) ?? const []) {
       final f = (raw as Map).cast<String, dynamic>();
-      final id = (f['id'] as num).toInt();
+      final id = _id(f['id'], frameIds, 'frame');
       if (id > highest) highest = id;
       doc.frames.add(
         SpriteFrame(
@@ -190,15 +233,19 @@ abstract final class JspriteCodec {
       final layer = (c['layer'] as num).toInt();
       final frame = (c['frame'] as num).toInt();
       if (doc.layerById(layer) == null || doc.frameIndex(frame) < 0) continue;
+      final x = (c['x'] as num).toInt(), y = (c['y'] as num).toInt();
       final w = (c['w'] as num).toInt(), h = (c['h'] as num).toInt();
+      // What the encoder writes is a rectangle of the canvas, never more:
+      // checked before the size it claims is unpacked or allocated.
+      if (x < 0 || y < 0 || w < 1 || h < 1 || x + w > width || y + h > height) {
+        throw const FormatException('A cel in this sprite is damaged.');
+      }
       final bytes = _inflate(c['data'] as String, w * h * 4);
       if (bytes.length != w * h * 4) {
         throw const FormatException('A cel in this sprite is damaged.');
       }
       final part = PixelBuffer.fromRgbaBytes(w, h, bytes);
-      doc
-          .ensureCel(layer, frame)
-          .paste(part, (c['x'] as num).toInt(), (c['y'] as num).toInt());
+      doc.ensureCel(layer, frame).paste(part, x, y);
     }
     if (json['export'] case final Map<String, dynamic> export) {
       doc.exportOptions = SheetExportOptions.fromJson(export);

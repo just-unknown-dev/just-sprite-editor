@@ -6,6 +6,8 @@ import 'package:just_game_engine/just_game_engine.dart';
 import 'package:just_editor_core/just_editor_core.dart'
     show PackageAssetPaths;
 
+import '../studio_files.dart';
+
 /// What is selected in the graph: a state, a transition, or nothing.
 class GraphSelection {
   const GraphSelection.state(String name) : state = name, transition = null;
@@ -148,16 +150,25 @@ class AnimatorGraphSession {
     var next = g;
     var x = 260.0 + g.states.length * 40;
     for (final clip in missing) {
+      // Named for its clip, unless a state already has that name — one
+      // that plays another clip: then a name of its own, and the clip said.
+      final taken = {for (final s in next.states) s.name};
+      var name = clip, n = 2;
+      while (taken.contains(name)) {
+        name = '$clip$n';
+        n++;
+      }
       next = next.copyWith(
         states: [
           ...next.states,
           AnimatorState(
-            name: clip,
+            name: name,
+            clip: name == clip ? '' : clip,
             x: x,
             y: 80.0 + next.states.length % 3 * 90,
           ),
         ],
-        entry: next.states.isEmpty && next.entry.isEmpty ? clip : next.entry,
+        entry: next.states.isEmpty && next.entry.isEmpty ? name : next.entry,
       );
       x += 170;
     }
@@ -201,6 +212,7 @@ class AnimatorGraphSession {
       // One step back is where the node was before the drag began, not
       // where it was a pixel ago.
       _undo.add(_dragBase ?? graph.value);
+      if (_undo.length > 200) _undo.removeAt(0);
       _dragBase = null;
       _redo.clear();
       graph.value = next;
@@ -208,6 +220,18 @@ class AnimatorGraphSession {
       _dragBase ??= graph.value;
       graph.value = next;
     }
+  }
+
+  /// Ends a drag of [name] that stopped without a release — the pointer
+  /// lost: where the node got to stays, as the one step the drag is.
+  void endMove(String name) {
+    if (_dragBase == null) return;
+    final now = g.stateNamed(name);
+    if (now == null) {
+      _dragBase = null;
+      return;
+    }
+    moveState(name, now.x, now.y, commit: true);
   }
 
   AnimatorGraph? _dragBase;
@@ -344,12 +368,26 @@ class AnimatorGraphSession {
     );
   }
 
-  /// Removes a parameter and every condition that tested it.
+  /// Removes a parameter and every condition that tested it. A blend tree
+  /// that blended by it keeps its motions but no longer names it: the
+  /// graph's problems say so, until another parameter is picked.
   void removeParameter(String name) => apply(
     g.copyWith(
       parameters: [
         for (final p in g.parameters)
           if (p.name != name) p,
+      ],
+      states: [
+        for (final st in g.states)
+          st.blend == null ||
+                  (st.blend!.parameter != name && st.blend!.parameterY != name)
+              ? st
+              : st.copyWith(
+                  blend: st.blend!.copyWith(
+                    parameter: st.blend!.parameter == name ? '' : null,
+                    parameterY: st.blend!.parameterY == name ? '' : null,
+                  ),
+                ),
       ],
       transitions: [
         for (final t in g.transitions)
@@ -397,8 +435,44 @@ class AnimatorGraphSession {
 
   // ── The atlas: where clip names come from ────────────────────────────────
 
+  /// [readClipNames], kept: the file is read again only when the clip
+  /// source changes — its path, or the file's time or size, looked at no
+  /// more than once a second. What a view asks on every build.
+  List<String> clipNames() {
+    final atlas = g.atlasPath.trim();
+    final now = DateTime.now();
+    final checked = _clipsCheckedAt;
+    if (atlas == _clipsOf &&
+        checked != null &&
+        now.difference(checked) < const Duration(seconds: 1)) {
+      return _clips;
+    }
+    _clipsCheckedAt = now;
+    final stamp = _stampOf(atlas);
+    if (atlas == _clipsOf && stamp == _clipsStamp) return _clips;
+    _clipsOf = atlas;
+    _clipsStamp = stamp;
+    return _clips = readClipNames();
+  }
+
+  List<String> _clips = const [];
+  String? _clipsOf;
+  String? _clipsStamp;
+  DateTime? _clipsCheckedAt;
+
+  String? _stampOf(String atlas) {
+    if (atlas.isEmpty) return null;
+    try {
+      final stat = PackageAssetPaths.of(root).file(atlas).statSync();
+      return '${stat.modified.microsecondsSinceEpoch}:${stat.size}';
+    } on FileSystemException {
+      return null;
+    }
+  }
+
   /// The clips of the graph's atlas, read from its JSON; empty when there
-  /// is none or it cannot be read.
+  /// is none or it cannot be read. Reads the file every time: [clipNames]
+  /// is the one to ask often.
   List<String> readClipNames() {
     final atlas = g.atlasPath.trim();
     if (atlas.isEmpty) return const [];
@@ -407,7 +481,7 @@ class AnimatorGraphSession {
     if (lower.endsWith('.glb') || lower.endsWith('.gltf')) {
       try {
         return modelClipNames(
-          PackageAssetPaths.of(root).file(atlas).readAsBytesSync(),
+          _modelJson(PackageAssetPaths.of(root).file(atlas)),
         );
       } catch (_) {
         return const [];
@@ -428,6 +502,33 @@ class AnimatorGraphSession {
       ];
     } catch (_) {
       return const [];
+    }
+  }
+
+  /// What of a model [file] [modelClipNames] needs: a `.gltf` whole, but of
+  /// a `.glb` only its header and JSON chunk — not the meshes and textures
+  /// after them, which can be most of the file.
+  static Uint8List _modelJson(File file) {
+    final raf = file.openSync();
+    try {
+      final head = raf.readSync(20);
+      final isGlb =
+          head.length >= 20 &&
+          head[0] == 0x67 &&
+          head[1] == 0x6C &&
+          head[2] == 0x54 &&
+          head[3] == 0x46;
+      if (!isGlb) {
+        raf.setPositionSync(0);
+        return raf.readSync(raf.lengthSync());
+      }
+      final length = ByteData.sublistView(head).getUint32(12, Endian.little);
+      return (BytesBuilder(copy: false)
+            ..add(head)
+            ..add(raf.readSync(length)))
+          .toBytes();
+    } finally {
+      raf.closeSync();
     }
   }
 
@@ -468,7 +569,8 @@ class AnimatorGraphSession {
     }
     final file = PackageAssetPaths.of(root).file(target);
     await file.parent.create(recursive: true);
-    await file.writeAsString(g.encode());
+    // Whole or not at all: a failed save leaves the graph that was there.
+    await writeAtomically(file, utf8.encode(g.encode()));
     path = target;
     _saved = graph.value;
     // Dirtiness is identity: tell listeners it changed without a new graph.
