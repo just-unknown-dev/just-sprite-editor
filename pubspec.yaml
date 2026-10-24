@@ -4,6 +4,8 @@ version: 0.1.0
 homepage: https://github.com/just-unknown-dev/just-sprite-editor
 repository: https://github.com/just-unknown-dev/just-sprite-editor
 issue_tracker: https://github.com/just-unknown-dev/just-sprite-editor/issues
+# A plugin: shared through the Asset Store from GitHub, never pub.dev.
+publish_to: none
 
 environment:
   sdk: ^3.11.0
@@ -12,7 +14,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  just_game_engine: ^2.0.0
+  just_game_engine: ^2.0.0-dev.2
   just_signals: ^1.0.2
   # zlib for .jsprite cels, PNG pixels and Aseprite cels. Pure Dart, so the
   # document core runs on the web too.

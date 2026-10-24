@@ -1,0 +1,78 @@
+# Push a tag like v1.2.0: pack the package into its archive and attach it to
+# a GitHub Release, with the catalog's version file and just_release.json —
+# the file every release carries under the same name, which the store's
+# refresh finds and `just add https://github.com/<owner>/<repo>` reads. The
+# release notes are the CHANGELOG.md section for that version.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  # The store tool, at a version that never moves under this workflow.
+  STORE_VERSION: 0.2.0
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+
+      - name: Install the store tool
+        run: dart pub global activate just_asset_store "$STORE_VERSION"
+
+      # The tag reaches the shell as a variable, never as script text.
+      - name: The tag matches the version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(grep -E '^version:' pubspec.yaml | head -n 1 | tr -d '\r' \
+            | sed -E "s/^version:[[:space:]]*//; s/[[:space:]]*(#.*)?$//; s/^['\"]//; s/['\"]$//")
+          test "v$version" = "$TAG" \
+            || { echo "Tag $TAG but pubspec says $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Your claim code (the store's Publish page shows it) says your store
+      # account may publish this package: the store lists a release only
+      # when its just_release.json carries it.
+      - name: Pack
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          CLAIM: ${{ vars.JUST_STORE_CLAIM }}
+        run: |
+          test -n "$CLAIM" || {
+            echo "::error::Set the repository variable JUST_STORE_CLAIM to your claim code (Settings → Secrets and variables → Actions → Variables)."
+            exit 1
+          }
+          dart pub global run just_asset_store:just_plugin store pack . \
+            -o dist --tag "$TAG" --claim "$CLAIM" \
+            --url "https://github.com/$REPO/releases/download/$TAG"
+
+      - name: Release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '/^## /{p = ($2 == v || $2 == "[" v "]")} p' \
+            CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          test -s "$RUNNER_TEMP/notes.md" \
+            || { echo "CHANGELOG.md has no '## $VERSION' section"; exit 1; }
+
+      # A draft first, published once every file is attached: with release
+      # immutability on (the store requires it), a published release can't
+      # gain or change files.
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --draft --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+          gh release edit "$TAG" --draft=false

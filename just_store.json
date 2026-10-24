@@ -1,8 +1,10 @@
 {
-  "category": "editors",
-  "dependencies": {
-    "just_game_engine_editor": "^0.1.0-dev.1"
+  "author": {
+    "name": "Just Unknown",
+    "url": "https://justunknown.com"
   },
+  "category": "editors",
+  "description": "A pixel-art sprite editor and animator: layers, frames, tags and onion skin, and a node graph for the animation state machine the engine plays at runtime. It opens .jsprite files from the Assets dock and saves the sprite sheet and animator beside them.",
   "editor": {
     "editorOnlyLibraries": [
       "*"
@@ -17,10 +19,30 @@
   },
   "id": "just_sprite_editor",
   "kind": "editor-extension",
+  "license": {
+    "file": "LICENSE",
+    "spdx": "BSD-3-Clause"
+  },
   "name": "Sprite Studio",
+  "permissions": [
+    "files",
+    "native"
+  ],
+  "previews": [
+    "store/card.png"
+  ],
   "requires": {
-    "just_game_engine": "^2.0.0"
+    "just_game_engine": "^2.0.0-dev.2",
+    "just_game_engine_editor": "^0.1.0-dev.1"
   },
   "schema": 1,
+  "stage": "beta",
+  "summary": "Draw and animate pixel-art sprites inside the editor.",
+  "tags": [
+    "sprites",
+    "pixel art",
+    "animation",
+    "animator"
+  ],
   "version": "0.1.0"
 }

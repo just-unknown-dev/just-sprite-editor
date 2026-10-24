@@ -1,24 +1,28 @@
 # melos_managed_dependency_overrides: dart_mappable_builder,digit_data_model
 dependency_overrides:
   just_editor_core:
-    path: ../just_editor_core
+    path: ../../packages/just_editor_core
   just_game_engine:
-    path: ../just_game_engine
+    path: ../../packages/just_game_engine
   just_graphics_engine:
-    path: ../just_graphics_engine
+    path: ../../packages/just_graphics_engine
   just_audio_engine:
-    path: ../just_audio_engine
+    path: ../../packages/just_audio_engine
   just_game_engine_formats:
-    path: ../just_game_engine_formats
+    path: ../../packages/just_game_engine_formats
   just_tiled:
-    path: ../just_tiled
+    path: ../../packages/just_tiled
   just_box_2d:
-    path: ../just_box_2d
+    path: ../../packages/just_box_2d
   just_physics_engine:
-    path: ../just_physics_engine
+    path: ../../packages/just_physics_engine
   just_jolt:
-    path: ../just_jolt
+    path: ../../packages/just_jolt
   just_inputs:
-    path: ../just_inputs
+    path: ../../packages/just_inputs
   just_game_engine_editor:
-    path: ../just_game_engine_editor
+    path: ../../packages/just_game_engine_editor
+  just_asset_store:
+    path: ../../packages/just_asset_store
+  just_core_cli:
+    path: ../../packages/just_core_cli
